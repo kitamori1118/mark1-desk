@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
 import Link from 'next/link';
 
@@ -17,25 +18,48 @@ interface DeskTag {
 }
 
 export default function SettingsPage() {
+  const router = useRouter();
+  const [authed, setAuthed] = useState(false); // ログイン確認が済むまで画面を出さない
+  const [notice, setNotice] = useState(''); // 失敗したときのメッセージ
+
   const [memories, setMemories] = useState<BrainMemory[]>([]);
   const [tags, setTags] = useState<DeskTag[]>([]);
-  
+
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
   const [newTag, setNewTag] = useState('');
-  
+
   const [loading, setLoading] = useState(false);
 
   const fetchData = async () => {
-    const { data: memData } = await supabase.from('brain_context').select('*').order('updated_at', { ascending: false });
-    if (memData) setMemories(memData);
+    const { data: memData, error: memErr } = await supabase
+      .from('brain_context')
+      .select('*')
+      .order('updated_at', { ascending: false });
+    if (memErr) setNotice(`記憶の読み込みに失敗しました: ${memErr.message}`);
+    else if (memData) setMemories(memData);
 
-    const { data: tagData } = await supabase.from('desk_tags').select('*').order('created_at', { ascending: true });
-    if (tagData) setTags(tagData);
+    const { data: tagData, error: tagErr } = await supabase
+      .from('desk_tags')
+      .select('*')
+      .order('created_at', { ascending: true });
+    if (tagErr) setNotice(`タグの読み込みに失敗しました: ${tagErr.message}`);
+    else if (tagData) setTags(tagData);
   };
 
   useEffect(() => {
-    fetchData();
+    supabase.auth.getSession().then(({ data }) => {
+      if (!data.session) {
+        router.replace('/login');
+        return;
+      }
+      setAuthed(true);
+      fetchData();
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((event) => {
+      if (event === 'SIGNED_OUT') router.replace('/login');
+    });
+    return () => sub.subscription.unsubscribe();
   }, []);
 
   const handleAddMemory = async (e: React.FormEvent) => {
@@ -43,19 +67,28 @@ export default function SettingsPage() {
     if (!content.trim() || loading) return;
 
     setLoading(true);
-    await supabase.from('brain_context').insert({
+    setNotice('');
+    const { error } = await supabase.from('brain_context').insert({
       title: title.trim() || 'Untitled Note',
       content: content.trim(),
     });
 
-    setTitle('');
-    setContent('');
+    if (error) {
+      setNotice(`保存に失敗しました: ${error.message}`);
+    } else {
+      setTitle('');
+      setContent('');
+    }
     setLoading(false);
     fetchData();
   };
 
+  // .select() で「実際に消えた行」を受け取る。RLS に DELETE の許可が無いと、エラーなしで0件になるため
   const handleDeleteMemory = async (id: string) => {
-    await supabase.from('brain_context').delete().eq('id', id);
+    const { data, error } = await supabase.from('brain_context').delete().eq('id', id).select('id');
+    if (error) setNotice(`削除に失敗しました: ${error.message}`);
+    else if (!data || data.length === 0) setNotice('削除できませんでした（Supabase の RLS に DELETE の許可が無い可能性）');
+    else setNotice('');
     fetchData();
   };
 
@@ -65,16 +98,32 @@ export default function SettingsPage() {
     const cleanTag = newTag.replace('@', '').trim();
     if (!cleanTag) return;
 
-    await supabase.from('desk_tags').insert({ tag_name: cleanTag });
-    setNewTag('');
+    const { error } = await supabase.from('desk_tags').insert({ tag_name: cleanTag });
+    if (error) {
+      setNotice(error.code === '23505' ? `タグ「${cleanTag}」は既にあります` : `タグの追加に失敗しました: ${error.message}`);
+    } else {
+      setNotice('');
+      setNewTag('');
+    }
     fetchData();
   };
 
   // 💡 タグの削除
   const handleDeleteTag = async (id: string) => {
-    await supabase.from('desk_tags').delete().eq('id', id);
+    const { data, error } = await supabase.from('desk_tags').delete().eq('id', id).select('id');
+    if (error) setNotice(`削除に失敗しました: ${error.message}`);
+    else if (!data || data.length === 0) setNotice('削除できませんでした（Supabase の RLS に DELETE の許可が無い可能性）');
+    else setNotice('');
     fetchData();
   };
+
+  if (!authed) {
+    return (
+      <div className="min-h-screen bg-[#030712] text-[#00f0ff] font-mono flex items-center justify-center text-xs tracking-widest">
+        AUTHENTICATING...
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[#030712] text-[#00f0ff] font-mono p-4 md:p-8 relative">
@@ -94,10 +143,19 @@ export default function SettingsPage() {
           </Link>
         </div>
 
+        {notice && (
+          <div className="flex justify-between items-start gap-3 bg-rose-950/40 border border-rose-400/60 text-rose-200 rounded-xl px-4 py-2.5 mb-6 text-xs">
+            <span>⚠ {notice}</span>
+            <button type="button" onClick={() => setNotice('')} className="shrink-0 text-slate-400 hover:text-white">
+              ✕
+            </button>
+          </div>
+        )}
+
         {/* 💡 タグマネージャーセクション */}
         <div className="bg-[#0a1128]/95 border border-[#00f0ff]/40 rounded-xl p-4 mb-6">
           <h2 className="text-xs tracking-widest text-slate-300 font-bold mb-3">🏷️ クイック @タグ の管理（デスクの入力スロットに連動）</h2>
-          
+
           <div className="flex flex-wrap gap-2 mb-4">
             {tags.map((t) => (
               <div key={t.id} className="flex items-center gap-1 bg-[#030712] border border-[#00f0ff]/40 text-[#00f0ff] px-3 py-1 rounded-full text-xs">
