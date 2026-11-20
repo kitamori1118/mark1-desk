@@ -3,6 +3,7 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { executeDeskPlan } from '@/lib/deskEngine';
 import { compressNodes, createPlan, createWhisper, isReplayable, validateExecutionPlan } from '@/lib/desk/planner';
 import { undoLastOp } from '@/lib/desk/ops';
+import { getResolvedModel } from '@/lib/desk/model';
 import { findSimilar } from '@/lib/desk/similar';
 import type { DeskNode } from '@/lib/desk/types';
 
@@ -14,6 +15,9 @@ import type { DeskNode } from '@/lib/desk/types';
  *   { action: 'save_macro', name, command, plan }   直前のプランをマクロとして保存
  *   { action: 'whisper', nodeId }     新ノードに対する先回り提案（類似ノードがあるときだけAI）
  */
+
+// Vercel の関数実行時間の上限（秒）。AI待ちが長いときに途中で切られないようにする
+export const maxDuration = 60;
 
 const MAX_COMMAND_LENGTH = 500;
 const MAX_BRAIN_CHARS = 8000;
@@ -128,8 +132,12 @@ export async function POST(request: Request) {
 
     const [nodes, brain] = await Promise.all([loadNodes(db), loadBrain(db)]);
     const { compressed, idMap } = compressNodes(nodes, { includeArchived: ARCHIVE_WORDS.test(command) });
+    const t0 = Date.now();
     const { plan, warnings } = await createPlan({ command, brain, nodes: compressed });
+    const t1 = Date.now();
     const result = await executeDeskPlan(plan, { db, nodes, idMap, command });
+    const t2 = Date.now();
+    console.log(`[JARVIS] "${command}" → ${plan.plan.map((p) => p.tool).join(', ') || '(no steps)'} | AI ${t1 - t0}ms, exec ${t2 - t1}ms`);
 
     return NextResponse.json({
       success: result.success,
@@ -141,6 +149,7 @@ export async function POST(request: Request) {
       reports: result.reports,
       clarify: plan.clarify ?? null,
       unsupported: plan.unsupported ?? null,
+      timing: { planMs: t1 - t0, execMs: t2 - t1, model: getResolvedModel() },
       // マクロ保存ボタン用：条件だけで再実行できるプランのときだけ返す
       savablePlan: isReplayable(plan) ? plan : null,
     });

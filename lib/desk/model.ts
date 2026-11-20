@@ -8,18 +8,38 @@ import type { GoogleGenAI } from '@google/genai';
  *   3. エイリアス gemini-flash-latest / gemini-flash-lite-latest
  *   4. models.list() で見つかった Flash 系（新しい世代・通常版を優先）
  * 404 や「無料枠の上限が0」のモデルは飛ばして次を試す。それ以外のエラーはそのまま投げる。
+ *
+ * また、応答が返ってこないまま画面が止まらないよう、1回ごとに時間制限をかけ、全体の締め切りも守る。
  */
 
 type Kind = 'standard' | 'lite';
 const resolved: Partial<Record<Kind, string>> = {};
 
+/** 今使っているモデル名（画面の表示・デバッグ用） */
+export const getResolvedModel = (kind: Kind = 'standard') => resolved[kind] ?? null;
+
 const isSkippable = (e: unknown) =>
   /404|NOT_FOUND|no longer available|is not found|limit:\s*0/i.test(String((e as any)?.message ?? e));
+
+const withTimeout = <T>(p: Promise<T>, ms: number, label: string): Promise<T> =>
+  new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} が ${Math.round(ms / 1000)} 秒以内に応答しませんでした`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
+  });
 
 async function listFlashModels(ai: GoogleGenAI): Promise<{ name: string; lite: boolean }[]> {
   const found: { name: string; lite: boolean; v: number; preview: boolean }[] = [];
   try {
-    const pager = await (ai as any).models.list();
+    const pager: any = await withTimeout((ai as any).models.list(), 8000, 'モデル一覧の取得');
     for await (const m of pager) {
       const name = String(m.name ?? '').replace(/^models\//, '');
       const mt = name.match(/^gemini-(\d+(?:\.\d+)?)-flash(-lite)?(-preview[\w.-]*)?$/);
@@ -35,10 +55,23 @@ async function listFlashModels(ai: GoogleGenAI): Promise<{ name: string; lite: b
   return found;
 }
 
+/** 考える量を抑えて速くする（プラン作成は複雑な推論が不要）。非対応のモデルなら、設定なしで1回だけやり直す */
+async function callOnce(ai: GoogleGenAI, model: string, req: { contents: string; config?: any }) {
+  const call = (config: any) => (ai as any).models.generateContent({ model, contents: req.contents, config });
+  try {
+    return await call({ ...req.config, thinkingConfig: { thinkingBudget: 1024 } });
+  } catch (e) {
+    const msg = String((e as any)?.message ?? e);
+    if (/thinking/i.test(msg) && /400|INVALID_ARGUMENT/i.test(msg)) return call(req.config);
+    throw e;
+  }
+}
+
 export async function generateWithFallback(
   ai: GoogleGenAI,
   req: { contents: string; config?: any },
-  kind: Kind = 'standard'
+  kind: Kind = 'standard',
+  opts: { deadline?: number; perCallMs?: number } = {}
 ) {
   const candidates: string[] = [];
   const add = (n?: string | null) => n && !candidates.includes(n) && candidates.push(n);
@@ -46,12 +79,18 @@ export async function generateWithFallback(
   add(kind === 'lite' ? process.env.GEMINI_MODEL_LITE || process.env.GEMINI_MODEL : process.env.GEMINI_MODEL);
   add(kind === 'lite' ? 'gemini-flash-lite-latest' : 'gemini-flash-latest');
 
+  const remaining = () => (opts.deadline ?? Infinity) - Date.now();
   let listed = false;
   let lastErr: unknown;
   for (let i = 0; i < candidates.length && i < 8; i++) {
     const model = candidates[i];
+    if (remaining() < 3000) throw new Error('時間切れ: AIの応答待ちが長引いたため中止しました。もう一度お試しください');
     try {
-      const res = await (ai as any).models.generateContent({ model, contents: req.contents, config: req.config });
+      const res = await withTimeout(
+        callOnce(ai, model, req),
+        Math.min(opts.perCallMs ?? 40_000, remaining()),
+        `モデル ${model}`
+      );
       resolved[kind] = model;
       return res;
     } catch (e) {
@@ -60,7 +99,10 @@ export async function generateWithFallback(
       if (i === candidates.length - 1 && !listed) {
         listed = true;
         const all = await listFlashModels(ai);
-        const preferred = kind === 'lite' ? [...all.filter((m) => m.lite), ...all.filter((m) => !m.lite)] : [...all.filter((m) => !m.lite), ...all.filter((m) => m.lite)];
+        const preferred =
+          kind === 'lite'
+            ? [...all.filter((m) => m.lite), ...all.filter((m) => !m.lite)]
+            : [...all.filter((m) => !m.lite), ...all.filter((m) => m.lite)];
         preferred.forEach((m) => add(m.name));
       }
     }

@@ -150,3 +150,35 @@ export const deadlineAlert = defineTool({
     return hits.length ? `deadline_alert: 期限超過${over}件 / 間近${hits.length - over}件` : 'deadline_alert: 期限が迫っているノードなし';
   },
 });
+
+/* ------------------------------------------------------------------ */
+/* delete_nodes：削除（↶ 戻す で復元できる）                              */
+/* ------------------------------------------------------------------ */
+
+export const deleteNodes = defineTool({
+  name: 'delete_nodes',
+  phase: 56,
+  replayable: false,
+  description:
+    'ノードを完全に削除する（実行後に「↶ 戻す」で復元できる）。「〇〇を削除して」「完了したものを消して」に使う。しまっておきたいだけなら archive を使う。何を消すかは、内容を読んで target.ids で明示する',
+  argsHint: '{ all?: boolean（今あるノードを全部消すと明確に頼まれたときだけ true） }',
+  defaultTarget: 'none',
+  argsSchema: z.object({ all: z.boolean().nullish() }),
+  async run(ctx, targets, args) {
+    if (!targets.length) return 'delete_nodes: 削除する対象なし（指令に合うノードが見つかりません）';
+    const live = ctx.nodes.filter((n) => !n.metadata?.archived).length;
+    if (targets.length >= live && live > 3 && !args.all) {
+      return `delete_nodes: 全${live}件の削除になるため中止しました（本当に全部消すなら「全部削除して」と指令してください）`;
+    }
+    const gone = new Set(targets.map((n) => n.id));
+    await ctx.deleteNodes([...gone]);
+
+    // 消えたノードへの線も外しておく
+    for (const n of ctx.nodes) {
+      const links = Array.isArray(n.metadata?.links) ? (n.metadata.links as string[]) : [];
+      const keep = links.filter((id) => !gone.has(id));
+      if (keep.length !== links.length) await ctx.patchNodes([n.id], { metadata: { links: keep.length ? keep : null } });
+    }
+    return `delete_nodes: ${gone.size}件を削除（↶ 戻す で復元できます）`;
+  },
+});

@@ -61,6 +61,8 @@ const VIEW_LABEL: Record<ViewLayout, string> = {
 const freeOrbSize = () => (typeof window !== 'undefined' && window.innerWidth >= 768 ? 192 : 176);
 
 const WHISPER_KEY = 'mark1desk.whisper';
+/** サーバー側の上限（60秒）より少し長く待ち、それでも返らなければ画面側で打ち切る */
+const CLIENT_TIMEOUT_MS = 70_000;
 
 export default function Mark1DeskPage() {
   const router = useRouter();
@@ -74,6 +76,10 @@ export default function Mark1DeskPage() {
 
   const [systemLog, setSystemLog] = useState('MARK1-DESK // NEURAL ORB MATRIX ONLINE.');
   const [loading, setLoading] = useState(false);
+  const [loadingLabel, setLoadingLabel] = useState('');
+  const [elapsed, setElapsed] = useState(0); // 実行中の経過秒数（止まっているのか待っているのか分かるように）
+  const abortRef = useRef<AbortController | null>(null);
+  const cancelledRef = useRef(false);
 
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
@@ -112,6 +118,16 @@ export default function Mark1DeskPage() {
       /* 保存できない環境では既定のOFFのまま */
     }
   }, []);
+  useEffect(() => {
+    if (!loading) {
+      setElapsed(0);
+      return;
+    }
+    const t0 = Date.now();
+    const id = setInterval(() => setElapsed(Math.floor((Date.now() - t0) / 1000)), 500);
+    return () => clearInterval(id);
+  }, [loading]);
+
   const toggleWhisper = () => {
     setWhisperOn((v) => {
       try {
@@ -267,34 +283,49 @@ export default function Mark1DeskPage() {
 
   /* ---------------- API 呼び出し ---------------- */
 
-  const post = async (body: Record<string, unknown>) => {
+  const post = async (body: Record<string, unknown>, track = true) => {
     const { data: sess } = await supabase.auth.getSession();
     const token = sess.session?.access_token;
     if (!token) {
       router.replace('/login');
       return null;
     }
+    const ctrl = new AbortController();
+    if (track) {
+      abortRef.current = ctrl;
+      cancelledRef.current = false;
+    }
+    const timer = setTimeout(() => ctrl.abort(), CLIENT_TIMEOUT_MS);
     try {
       const res = await fetch('/api/command', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify(body),
+        signal: ctrl.signal,
       });
       const text = await res.text();
       let json: any;
       try {
         json = JSON.parse(text);
       } catch {
-        // JSONではない＝Next.js自体のエラーページ。ルートが見つからない／ビルドエラーの可能性
-        setSystemLog(`ERROR: HTTP ${res.status} /api/command（app/api/command/route.ts の配置とビルドを確認）`);
+        // JSONではない＝Next.js自体のエラーページ。ルートが見つからない／ビルドエラー／時間切れの可能性
+        setSystemLog(`ERROR: HTTP ${res.status} /api/command（ルートの配置・ビルド・実行時間の上限を確認）`);
         return null;
       }
       if (res.status === 401) router.replace('/login');
       if (!res.ok && !json.error) json.error = `HTTP ${res.status}`;
       return json;
-    } catch {
-      setSystemLog('ERROR: 通信に失敗しました（ネットワークを確認）');
+    } catch (err) {
+      if (track && cancelledRef.current) {
+        setSystemLog('CANCELLED: 中断しました（サーバー側の処理は続いていることがあります。「↶ 戻す」で確認できます）');
+      } else if ((err as { name?: string })?.name === 'AbortError') {
+        setSystemLog(`ERROR: ${CLIENT_TIMEOUT_MS / 1000}秒たっても応答がありません（AIの混雑、またはサーバーが止まっている可能性）`);
+      } else {
+        setSystemLog('ERROR: 通信に失敗しました（ネットワークを確認）');
+      }
       return null;
+    } finally {
+      clearTimeout(timer);
     }
   };
 
@@ -309,7 +340,21 @@ export default function Mark1DeskPage() {
     if (warnings.length) console.warn('[JARVIS]', warnings);
 
     const prefix = data.clarify ? '❓ ' : data.unsupported ? '⚠ 未対応: ' : '';
-    setSystemLog(prefix + (data.log || 'COMMAND EXECUTED.') + (warnings.length ? ` (警告${warnings.length}件)` : ''));
+    // 通常の指令では、各ツールが実際に何をしたか（件数など）も出す。マクロ・Undoは log に含まれている
+    const done =
+      opts.command !== undefined && !data.clarify && !data.unsupported
+        ? (data.details ?? []).filter((d: string) => !d.startsWith('⚠')).join(' / ')
+        : '';
+    const timing = data.timing
+      ? ` ⏱AI ${(data.timing.planMs / 1000).toFixed(1)}秒${data.timing.model ? `・${data.timing.model}` : ''}`
+      : '';
+    setSystemLog(
+      prefix +
+        (data.log || 'COMMAND EXECUTED.') +
+        (done ? ` — ${done}` : '') +
+        (warnings.length ? ` (警告${warnings.length}件)` : '') +
+        timing
+    );
 
     // 聞き返し・未対応のときは指令を残して、言い直せるようにする
     if (opts.fromInput && !data.clarify && !data.unsupported) setCommand('');
@@ -323,13 +368,26 @@ export default function Mark1DeskPage() {
     }
   };
 
-  const runCommand = async (text: string, fromInput = false) => {
-    if (!text.trim() || loading) return;
+  /** 実行系の共通処理。どこで失敗しても、必ず「実行中」を解除して画面が固まらないようにする */
+  const withLoading = async (label: string, job: () => Promise<void>) => {
+    if (loading) return;
     setLoading(true);
-    setSystemLog(`JARVIS EXECUTING: "${text}"...`);
-    const data = await post({ command: text });
-    await handleResponse(data, { command: text, fromInput });
-    setLoading(false);
+    setLoadingLabel(label);
+    try {
+      await job();
+    } catch (e) {
+      setSystemLog(`ERROR: ${e instanceof Error ? e.message : '画面の更新に失敗しました'}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const runCommand = async (text: string, fromInput = false) => {
+    if (!text.trim()) return;
+    await withLoading(`「${text}」を実行中`, async () => {
+      const data = await post({ command: text });
+      await handleResponse(data, { command: text, fromInput });
+    });
   };
 
   const handleCommandSubmit = (e: React.FormEvent) => {
@@ -337,20 +395,19 @@ export default function Mark1DeskPage() {
     runCommand(command, true);
   };
 
-  const handleUndo = async () => {
-    if (loading) return;
-    setLoading(true);
-    setSystemLog('UNDO...');
-    await handleResponse(await post({ action: 'undo' }));
-    setLoading(false);
-  };
+  const handleUndo = () =>
+    withLoading('取り消し中', async () => {
+      await handleResponse(await post({ action: 'undo' }));
+    });
 
-  const runMacro = async (m: Macro) => {
-    if (loading) return;
-    setLoading(true);
-    setSystemLog(`MACRO: ${m.name}...`);
-    await handleResponse(await post({ action: 'run_macro', id: m.id }));
-    setLoading(false);
+  const runMacro = (m: Macro) =>
+    withLoading(`マクロ「${m.name}」を実行中`, async () => {
+      await handleResponse(await post({ action: 'run_macro', id: m.id }));
+    });
+
+  const cancelRunning = () => {
+    cancelledRef.current = true;
+    abortRef.current?.abort();
   };
 
   const saveMacro = async () => {
@@ -413,7 +470,7 @@ export default function Mark1DeskPage() {
 
       // 🛰 先回り提案：似たノードがあるときだけ、サーバー側でAIを呼ぶ
       if (whisperOn && created?.id) {
-        post({ action: 'whisper', nodeId: created.id }).then((d) => {
+        post({ action: 'whisper', nodeId: created.id }, false).then((d) => {
           if (d?.whisper?.message) setWhisper(d.whisper);
         });
       }
@@ -775,11 +832,16 @@ export default function Mark1DeskPage() {
       )}
 
       <footer className="fixed bottom-0 left-0 right-0 z-30 bg-[#030712]/95 backdrop-blur-xl border-t border-[#00f0ff33] p-3 md:p-4">
+        {loading && <div className="absolute top-0 left-0 right-0 h-0.5 bg-[#00f0ff] animate-pulse" />}
         <div className="max-w-4xl mx-auto flex flex-col gap-2">
           <div className="flex justify-between items-center text-[10px] md:text-xs text-slate-400">
             <div className="flex items-center gap-2 truncate">
               <span className="text-[#00f0ff] font-bold">JARVIS:</span>
-              <span className="truncate">{systemLog}</span>
+              <span className="truncate">
+                {loading
+                  ? `⏳ ${loadingLabel} … ${elapsed}秒${elapsed >= 20 ? '（AIの応答待ち。70秒で打ち切ります）' : ''}`
+                  : systemLog}
+              </span>
             </div>
 
             {!isInputOpen && (
@@ -865,13 +927,22 @@ export default function Mark1DeskPage() {
               disabled={loading}
               className="flex-1 bg-[#0a1128] border border-[#00f0ff]/40 rounded-xl px-3.5 py-2.5 text-xs md:text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-[#00f0ff]"
             />
-            <button
-              type="submit"
-              disabled={loading}
-              className="bg-[#00f0ff]/20 border border-[#00f0ff] text-[#00f0ff] px-5 py-2.5 rounded-xl text-xs md:text-sm font-bold tracking-wider hover:bg-[#00f0ff]/30 active:scale-95 transition-all disabled:opacity-50"
-            >
-              {loading ? '...EXE' : 'EXEC'}
-            </button>
+            {loading ? (
+              <button
+                type="button"
+                onClick={cancelRunning}
+                className="bg-rose-500/20 border border-rose-400 text-rose-200 px-5 py-2.5 rounded-xl text-xs md:text-sm font-bold tracking-wider hover:bg-rose-500/30 active:scale-95 transition-all"
+              >
+                ■ 中断
+              </button>
+            ) : (
+              <button
+                type="submit"
+                className="bg-[#00f0ff]/20 border border-[#00f0ff] text-[#00f0ff] px-5 py-2.5 rounded-xl text-xs md:text-sm font-bold tracking-wider hover:bg-[#00f0ff]/30 active:scale-95 transition-all"
+              >
+                EXEC
+              </button>
+            )}
           </form>
         </div>
       </footer>

@@ -246,17 +246,19 @@ User Command: ${JSON.stringify(p.command)}`;
 const isRetryable = (e: unknown) => /429|503|RESOURCE_EXHAUSTED|UNAVAILABLE/.test(String((e as any)?.message ?? e));
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function callGemini(prompt: string): Promise<string> {
-  // モデル名は model.ts が自動で見つけて覚える（404 のモデルは飛ばす）
+async function callGemini(prompt: string, deadline: number): Promise<string> {
+  // モデル名は model.ts が自動で見つけて覚える（404 のモデルは飛ばす）。時間制限つき
   const run = () =>
-    generateWithFallback(ai, {
-      contents: prompt,
-      config: { responseMimeType: 'application/json', responseSchema: planSchema, temperature: 0.1 },
-    });
+    generateWithFallback(
+      ai,
+      { contents: prompt, config: { responseMimeType: 'application/json', responseSchema: planSchema, temperature: 0.1 } },
+      'standard',
+      { deadline }
+    );
   try {
     return (await run()).text ?? '';
   } catch (e) {
-    if (!isRetryable(e)) throw e;
+    if (!isRetryable(e) || deadline - Date.now() < 8000) throw e;
     await sleep(1500); // 一時的な混雑は1回だけ待って再試行
     return (await run()).text ?? '';
   }
@@ -271,6 +273,7 @@ export async function createPlan(input: {
   brain: string;
   nodes: CompressedNode[];
 }): Promise<{ plan: ExecutionPlan; warnings: string[]; cached: boolean }> {
+  const deadline = Date.now() + 50_000; // 関数の実行時間上限（60秒）に収まるよう、AI待ちは合計50秒まで
   const base = buildPrompt({ ...input, today: toDay(new Date()) });
   const key = createHash('sha256').update(base).digest('hex');
 
@@ -282,9 +285,9 @@ export async function createPlan(input: {
   let prompt = base;
   let result = { plan: EMPTY, errors: [] as string[] };
   for (let attempt = 0; attempt < 2; attempt++) {
-    const text = await callGemini(prompt);
+    const text = await callGemini(prompt, deadline);
     result = parseAndValidate(text);
-    if (result.errors.length === 0) break;
+    if (result.errors.length === 0 || deadline - Date.now() < 15_000) break; // 残り時間が少ないなら、やり直さず今ある分を使う
     // 2回目は、前回の出力とエラーを見せて直させる
     prompt = `${base}\n\n=== YOUR PREVIOUS OUTPUT WAS INVALID ===\n${text}\nErrors:\n- ${result.errors.join('\n- ')}\nReturn corrected JSON only.`;
   }
