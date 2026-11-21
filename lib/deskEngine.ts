@@ -7,7 +7,7 @@ import type { DeskNode, ExecutionPlan, NewNode, NodePatch, PlanItem, ToolContext
 // 既存コードとの互換用
 export type { ExecutionPlan, PlanItem as ToolPlanItem } from './desk/types';
 
-const CHUNK = 20;
+const BULK = 200; // upsert 1回あたりの最大行数
 const MAX_STEPS = 12;
 
 const normalize = (row: any): DeskNode => ({ ...row, metadata: row.metadata ?? {} });
@@ -71,21 +71,26 @@ export async function executeDeskPlan(
         return;
       }
 
-      // metadata はノードごとにマージが必要
-      for (let i = 0; i < nodes.length; i += CHUNK) {
-        await Promise.all(
-          nodes.slice(i, i + CHUNK).map(async (n) => {
-            const next = mergeMeta(n.metadata, metadata);
-            const { error } = await db
-              .from('stark_nodes')
-              .update({ ...columns, metadata: next })
-              .eq('id', n.id);
-            if (error) throw new Error(`stark_nodes 更新に失敗: ${error.message}`);
-            Object.assign(n, columns);
-            n.metadata = next;
-          })
-        );
+      // metadata はノードごとにマージが必要。全行を1回の upsert でまとめて書く（ノード数ぶんの往復を避けて速くする）
+      const rows = nodes.map((n) => ({
+        id: n.id,
+        content: (columns as any).content ?? n.content,
+        category: (columns as any).category ?? n.category,
+        color: (columns as any).color ?? n.color,
+        status: (columns as any).status ?? n.status,
+        metadata: mergeMeta(n.metadata, metadata),
+        created_at: n.created_at,
+      }));
+      for (let i = 0; i < rows.length; i += BULK) {
+        const { error } = await db.from('stark_nodes').upsert(rows.slice(i, i + BULK), { onConflict: 'id' });
+        if (error) throw new Error(`stark_nodes 更新に失敗: ${error.message}`);
       }
+      const byRow = new Map(rows.map((r) => [r.id, r] as const));
+      nodes.forEach((n) => {
+        const r = byRow.get(n.id)!;
+        Object.assign(n, columns);
+        n.metadata = r.metadata;
+      });
       dirty = true;
     },
 

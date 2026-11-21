@@ -55,15 +55,35 @@ async function listFlashModels(ai: GoogleGenAI): Promise<{ name: string; lite: b
   return found;
 }
 
-/** 考える量を抑えて速くする（プラン作成は複雑な推論が不要）。非対応のモデルなら、設定なしで1回だけやり直す */
+/**
+ * 考える量を抑えて速くする（プラン作成は複雑な推論が不要）。
+ * モデルの世代によって指定の仕方が違う（3系は thinkingLevel、2.5系は thinkingBudget）ので、
+ * 受け付けられた指定を覚えておき、無理なら設定なしにやり直す。
+ */
+const thinkingChoice = new Map<string, number>(); // モデル名 → 使えた指定の番号
+const thinkingVariants = (model: string): (Record<string, unknown> | null)[] =>
+  /gemini-3/.test(model)
+    ? [{ thinkingLevel: 'LOW' }, { thinkingBudget: 0 }, null]
+    : [{ thinkingBudget: 0 }, null];
+
 async function callOnce(ai: GoogleGenAI, model: string, req: { contents: string; config?: any }) {
-  const call = (config: any) => (ai as any).models.generateContent({ model, contents: req.contents, config });
-  try {
-    return await call({ ...req.config, thinkingConfig: { thinkingBudget: 1024 } });
-  } catch (e) {
-    const msg = String((e as any)?.message ?? e);
-    if (/thinking/i.test(msg) && /400|INVALID_ARGUMENT/i.test(msg)) return call(req.config);
-    throw e;
+  const variants = thinkingVariants(model);
+  const call = (thinking: Record<string, unknown> | null) =>
+    (ai as any).models.generateContent({
+      model,
+      contents: req.contents,
+      config: thinking ? { ...req.config, thinkingConfig: thinking } : req.config,
+    });
+  for (let i = thinkingChoice.get(model) ?? 0; i < variants.length; i++) {
+    try {
+      const res = await call(variants[i]);
+      thinkingChoice.set(model, i);
+      return res;
+    } catch (e) {
+      const msg = String((e as any)?.message ?? e);
+      const thinkingProblem = /thinking/i.test(msg) && /400|INVALID_ARGUMENT/i.test(msg);
+      if (!thinkingProblem || i === variants.length - 1) throw e;
+    }
   }
 }
 

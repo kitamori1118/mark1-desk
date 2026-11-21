@@ -11,7 +11,8 @@ export async function recordOp(db: SupabaseClient, command: string, before: Desk
   const { error } = await db.from('desk_ops').insert({ command: command.slice(0, 200), before });
   if (error) throw new Error(`履歴の保存に失敗: ${error.message}`);
 
-  // 古い履歴を削除
+  // 古い履歴を削除（毎回やると往復が増えるので、5回に1回程度）
+  if (Math.random() > 0.2) return;
   const { data } = await db.from('desk_ops').select('id').order('created_at', { ascending: false }).range(KEEP, KEEP + 50);
   if (data?.length) {
     await db

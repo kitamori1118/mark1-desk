@@ -28,3 +28,24 @@ export function findSimilar(node: DeskNode, others: DeskNode[], k = 4, threshold
     .slice(0, k)
     .map((x) => x.o);
 }
+
+/**
+ * 先回り提案の下ごしらえ：新ノードに「関係がありそうな」既存ノード上位k件。
+ * 内容の近さに、同じカテゴリ・共通タグの加点を足す（閾値は低めにして、提案の機会を逃さない）。
+ */
+export function related(node: DeskNode, others: DeskNode[], k = 5, threshold = 0.08): DeskNode[] {
+  const tagsOf = (n: DeskNode) => (Array.isArray(n.metadata?.tags) ? (n.metadata.tags as string[]) : []);
+  const mine = new Set(tagsOf(node));
+  return others
+    .filter((o) => o.id !== node.id && !o.metadata?.archived)
+    .map((o) => {
+      let score = similarity(node.content, o.content);
+      if (o.category === node.category) score += 0.1;
+      score += 0.08 * tagsOf(o).filter((t) => mine.has(t)).length;
+      return { o, score };
+    })
+    .filter((x) => x.score >= threshold)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, k)
+    .map((x) => x.o);
+}

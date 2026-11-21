@@ -30,6 +30,7 @@ export interface NodeFilter {
   dueWithinDays?: number | null; // 期限が N 日以内（期限超過も含む）
   overdue?: boolean | null; // 期限超過のみ
   noDue?: boolean | null; // 期限なしのみ
+  keyword?: string | null; // 本文・カテゴリ・タグのどれかに含まれる（「〇〇に関するもの」）
 }
 
 /** ツールの対象指定 */

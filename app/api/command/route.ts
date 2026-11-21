@@ -4,16 +4,18 @@ import { executeDeskPlan } from '@/lib/deskEngine';
 import { compressNodes, createPlan, createWhisper, isReplayable, validateExecutionPlan } from '@/lib/desk/planner';
 import { undoLastOp } from '@/lib/desk/ops';
 import { getResolvedModel } from '@/lib/desk/model';
-import { findSimilar } from '@/lib/desk/similar';
-import type { DeskNode } from '@/lib/desk/types';
+import { related } from '@/lib/desk/similar';
+import { localPlan } from '@/lib/desk/localPlan';
+import { toDay } from '@/lib/desk/selector';
+import type { DeskNode, ExecutionPlan } from '@/lib/desk/types';
 
 /*
- * POST /api/command
- *   { command }                       自然文の指令（AIがプランを作る）
+ * POST /api/command   （すべてログイン必須。Authorization: Bearer <アクセストークン>）
+ *   { command }                       自然文の指令。定型は AI なしの高速パス、それ以外は AI がプランを作る
  *   { action: 'undo' }                直前の操作を取り消す（AIなし）
  *   { action: 'run_macro', id }       保存したマクロを実行（AIなし）
  *   { action: 'save_macro', name, command, plan }   直前のプランをマクロとして保存
- *   { action: 'whisper', nodeId }     新ノードに対する先回り提案（類似ノードがあるときだけAI）
+ *   { action: 'whisper', nodeId }     新ノードに対する先回り提案（関連ノードがあるときだけAI）
  */
 
 // Vercel の関数実行時間の上限（秒）。AI待ちが長いときに途中で切られないようにする
@@ -24,11 +26,12 @@ const MAX_BRAIN_CHARS = 8000;
 const UNDO_RE = /^\s*(undo|取り消し(て|ます)?|直前の(操作|指令)を(元に戻|取り消)(して|す)?)\s*[。.!！]*\s*$/i;
 const ARCHIVE_WORDS = /アーカイブ|復元|しまった|保管|archive/i;
 
-// 先回り提案の呼び出し上限（無料枠を守る簡易ガード。インスタンス単位）
+// 先回り提案のAI呼び出し上限（無料枠を守る簡易ガード。インスタンス単位）
 const whisperLog: number[] = [];
-const WHISPER_PER_HOUR = 30;
+const WHISPER_PER_HOUR = 40;
 
 const fail = (status: number, error: string) => NextResponse.json({ success: false, error }, { status });
+const unauth = (error = 'ログインが必要です') => NextResponse.json({ success: false, code: 'UNAUTHENTICATED', error }, { status: 401 });
 
 async function loadNodes(db: SupabaseClient): Promise<DeskNode[]> {
   const { data, error } = await db.from('stark_nodes').select('*').order('created_at', { ascending: true });
@@ -50,15 +53,17 @@ export async function POST(request: Request) {
   try {
     // 🔐 ログイン必須：ブラウザが送ってくるアクセストークンで、そのユーザーとして DB にアクセスする（RLSが効く）
     const token = (request.headers.get('authorization') ?? '').replace(/^Bearer\s+/i, '');
-    if (!token) return NextResponse.json({ success: false, code: 'UNAUTHENTICATED', error: 'ログインが必要です' }, { status: 401 });
+    if (!token) return unauth();
     const db = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, {
       global: { headers: { Authorization: `Bearer ${token}` } },
       auth: { persistSession: false, autoRefreshToken: false },
     });
-    const { data: who, error: whoErr } = await db.auth.getUser(token);
-    if (whoErr || !who?.user) {
-      return NextResponse.json({ success: false, code: 'UNAUTHENTICATED', error: 'ログインの有効期限が切れました' }, { status: 401 });
-    }
+    // 認証確認とデータ読み込みは同時に走らせる（待ち時間を重ねない）
+    const authP = db.auth.getUser(token);
+    const checkAuth = async () => {
+      const { data, error } = await authP;
+      return error || !data?.user ? unauth('ログインの有効期限が切れました') : null;
+    };
 
     const body = await request.json().catch(() => ({}));
     const action: string = typeof body?.action === 'string' ? body.action : 'command';
@@ -66,6 +71,8 @@ export async function POST(request: Request) {
 
     /* ---------- Undo ---------- */
     if (action === 'undo' || (action === 'command' && UNDO_RE.test(command))) {
+      const bad = await checkAuth();
+      if (bad) return bad;
       const r = await undoLastOp(db);
       return NextResponse.json({
         success: r.ok,
@@ -78,6 +85,8 @@ export async function POST(request: Request) {
 
     /* ---------- マクロ保存 ---------- */
     if (action === 'save_macro') {
+      const bad = await checkAuth();
+      if (bad) return bad;
       const name = typeof body.name === 'string' ? body.name.trim().slice(0, 40) : '';
       if (!name) return fail(400, 'マクロ名が空です');
       const { plan, errors } = validateExecutionPlan(body.plan);
@@ -94,6 +103,8 @@ export async function POST(request: Request) {
 
     /* ---------- マクロ実行（AIを呼ばない） ---------- */
     if (action === 'run_macro') {
+      const bad = await checkAuth();
+      if (bad) return bad;
       const { data, error } = await db.from('desk_macros').select('*').eq('id', body.id).single();
       if (error || !data) return fail(404, 'マクロが見つかりません');
       const { plan, errors } = validateExecutionPlan(data.plan);
@@ -111,33 +122,57 @@ export async function POST(request: Request) {
       });
     }
 
-    /* ---------- 先回り提案 ---------- */
+    /* ---------- 先回り提案（関連ノードがあるときだけAI） ---------- */
     if (action === 'whisper') {
+      const bad = await checkAuth();
+      if (bad) return bad;
       const now = Date.now();
       while (whisperLog.length && now - whisperLog[0] > 3_600_000) whisperLog.shift();
       const nodes = await loadNodes(db);
       const node = nodes.find((n) => n.id === body.nodeId);
-      if (!node) return NextResponse.json({ success: true, whisper: null });
-      const similar = findSimilar(node, nodes); // 似たノードが無ければAIを呼ばない
-      if (!similar.length || whisperLog.length >= WHISPER_PER_HOUR) return NextResponse.json({ success: true, whisper: null });
+      if (!node) return NextResponse.json({ success: true, whispers: [], reason: 'not_found' });
+      if (whisperLog.length >= WHISPER_PER_HOUR) return NextResponse.json({ success: true, whispers: [], reason: 'rate_limited' });
+      const rel = related(node, nodes);
+      if (!rel.length) return NextResponse.json({ success: true, whispers: [], reason: 'no_related' });
       whisperLog.push(now);
-      const { compressed } = compressNodes([node, ...similar]);
-      const whisper = await createWhisper({ node: compressed[0], candidates: compressed.slice(1), brain: await loadBrain(db) });
-      return NextResponse.json({ success: true, whisper });
+      const { compressed } = compressNodes([node, ...rel]);
+      const whispers = await createWhisper({
+        node: compressed[0],
+        related: compressed.slice(1),
+        brain: await loadBrain(db),
+        today: toDay(new Date()),
+      });
+      return NextResponse.json({ success: true, whispers, reason: whispers.length ? 'ok' : 'none' });
     }
 
     /* ---------- 通常の指令 ---------- */
     if (!command) return fail(400, '指令が空です');
     if (command.length > MAX_COMMAND_LENGTH) return fail(400, `指令は${MAX_COMMAND_LENGTH}文字以内にしてください`);
 
-    const [nodes, brain] = await Promise.all([loadNodes(db), loadBrain(db)]);
-    const { compressed, idMap } = compressNodes(nodes, { includeArchived: ARCHIVE_WORDS.test(command) });
+    const tLoad = Date.now();
+    const [bad, nodes, brain] = await Promise.all([checkAuth(), loadNodes(db), loadBrain(db)]);
+    if (bad) return bad;
+    const loadMs = Date.now() - tLoad;
+
+    // ⚡ 高速パス：定型の指令は AI を呼ばずにその場でプランを作る
     const t0 = Date.now();
-    const { plan, warnings } = await createPlan({ command, brain, nodes: compressed });
+    let plan: ExecutionPlan | null = localPlan(command, nodes, new Date());
+    const local = !!plan;
+    let warnings: string[] = [];
+    let idMap = new Map<string, string>();
+    if (!plan) {
+      const { compressed, idMap: map } = compressNodes(nodes, { includeArchived: ARCHIVE_WORDS.test(command) });
+      idMap = map;
+      const made = await createPlan({ command, brain, nodes: compressed });
+      plan = made.plan;
+      warnings = made.warnings;
+    }
     const t1 = Date.now();
     const result = await executeDeskPlan(plan, { db, nodes, idMap, command });
     const t2 = Date.now();
-    console.log(`[JARVIS] "${command}" → ${plan.plan.map((p) => p.tool).join(', ') || '(no steps)'} | AI ${t1 - t0}ms, exec ${t2 - t1}ms`);
+    console.log(
+      `[JARVIS] "${command}" → ${plan.plan.map((p) => p.tool).join(', ') || '(no steps)'} | ${local ? 'LOCAL' : 'AI'} ${t1 - t0}ms, load ${loadMs}ms, exec ${t2 - t1}ms`
+    );
 
     return NextResponse.json({
       success: result.success,
@@ -149,7 +184,7 @@ export async function POST(request: Request) {
       reports: result.reports,
       clarify: plan.clarify ?? null,
       unsupported: plan.unsupported ?? null,
-      timing: { planMs: t1 - t0, execMs: t2 - t1, model: getResolvedModel() },
+      timing: { local, planMs: t1 - t0, loadMs, execMs: t2 - t1, model: local ? null : getResolvedModel() },
       // マクロ保存ボタン用：条件だけで再実行できるプランのときだけ返す
       savablePlan: isReplayable(plan) ? plan : null,
     });

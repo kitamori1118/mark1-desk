@@ -1,7 +1,7 @@
 import { createHash } from 'crypto';
 import { z } from 'zod';
 import { GoogleGenAI, Type, Schema } from '@google/genai';
-import { buildToolCatalog, getTool, toolNames } from './registry';
+import { buildToolCatalog, getTool, needsJudgment, selectToolNames, toolNames } from './registry';
 import { generateWithFallback } from './model';
 import { nodeTags, toDay } from './selector';
 import type { DeskNode, ExecutionPlan, PlanItem } from './types';
@@ -54,6 +54,33 @@ export function compressNodes(nodes: DeskNode[], opts: { includeArchived?: boole
   return { compressed, idMap };
 }
 
+/**
+ * AIに渡すノード一覧を、JSONではなく1行1ノードの短い形式にする（トークンが約半分になり、応答が速くなる）
+ *   n3 [カテゴリ] タイトル #タグ due=2026-11-30 stage=進行中 col=amber st=scanned pin links=2 @2026-11-02
+ * 既定値（色cyan・状態normal・タグがカテゴリだけ）は省く。作成日は日付に関係する指令のときだけ付ける。
+ */
+const DATE_WORDS = /作成|いつ|週|月|日|古|新し|最近|今日|昨日|時系列|タイムライン|時期|期間/;
+
+export function formatNodes(nodes: CompressedNode[], command: string): string {
+  const withDates = DATE_WORDS.test(command);
+  return nodes
+    .map((n) => {
+      const parts = [`${n.id} [${n.category}] ${n.title}`];
+      const extraTags = n.tags.filter((t) => t !== n.category);
+      if (extraTags.length) parts.push(extraTags.map((t) => `#${t}`).join(' '));
+      if (n.due) parts.push(`due=${n.due}`);
+      if (n.stage) parts.push(`stage=${n.stage}`);
+      if (n.color !== 'cyan') parts.push(`col=${n.color}`);
+      if (n.status !== 'normal') parts.push(`st=${n.status}`);
+      if (n.pinned) parts.push('pin');
+      if (n.archived) parts.push('archived');
+      if (n.linked) parts.push(`links=${n.linked}`);
+      if (withDates) parts.push(`@${n.created}`);
+      return parts.join(' ');
+    })
+    .join('\n');
+}
+
 /* ------------------------------------------------------------------ */
 /* Gemini に渡すレスポンススキーマ                                       */
 /* ------------------------------------------------------------------ */
@@ -75,6 +102,7 @@ const filterSchema: Schema = {
     dueWithinDays: { type: Type.INTEGER, description: '期限がN日以内（期限超過を含む）' },
     overdue: { type: Type.BOOLEAN },
     noDue: { type: Type.BOOLEAN },
+    keyword: { type: Type.STRING, description: '本文・カテゴリ・タグのどれかに含まれる語。「〇〇に関するもの」はこれを使う' },
   },
 };
 
@@ -92,16 +120,16 @@ const targetSchema: Schema = {
  * args は「JSON文字列」で受け取る。
  * Gemini は properties 未定義のOBJECTを空 {} で返しがちなので、文字列で受けてZodで検証するほうが確実。
  */
-const planSchema: Schema = {
+const buildPlanSchema = (names: string[]): Schema => ({
   type: Type.OBJECT,
   properties: {
-    message: { type: Type.STRING, description: 'HUDログバーに出す一言（日本語・短く）' },
+    message: { type: Type.STRING, description: 'HUDログバーに出す一言（日本語・20字程度）' },
     plan: {
       type: Type.ARRAY,
       items: {
         type: Type.OBJECT,
         properties: {
-          tool: { type: Type.STRING, enum: toolNames() },
+          tool: { type: Type.STRING, enum: names },
           target: targetSchema,
           args_json: { type: Type.STRING, description: 'ツール引数のJSON文字列。無ければ "{}"' },
         },
@@ -112,7 +140,7 @@ const planSchema: Schema = {
     clarify: { type: Type.STRING, nullable: true },
   },
   required: ['message', 'plan'],
-};
+});
 
 /* ------------------------------------------------------------------ */
 /* 検証（Zod）                                                          */
@@ -133,6 +161,7 @@ const filterZ = z.object({
   dueWithinDays: z.number().nullish(),
   overdue: z.boolean().nullish(),
   noDue: z.boolean().nullish(),
+  keyword: z.string().nullish(),
 });
 
 const targetZ = z.object({
@@ -209,33 +238,34 @@ export function parseAndValidate(text: string): { plan: ExecutionPlan; errors: s
 /* プロンプト                                                           */
 /* ------------------------------------------------------------------ */
 
-function buildPrompt(p: { command: string; brain: string; nodes: CompressedNode[]; today: string }): string {
+function buildPrompt(p: { command: string; brain: string; nodesText: string; today: string; toolNames: string[] | null }): string {
   // 共通部分（ツールカタログ・ルール）を先頭に置くと、暗黙キャッシュが効きやすい
   return `You are JARVIS, the executive AI of Mark1-desk.
-You never edit data directly. You output an execution PLAN (JSON); deterministic code executes it.
+You never edit data directly. You output an execution PLAN (JSON); deterministic code executes it. Be fast and terse.
 
 === TOOLS ===
-${buildToolCatalog()}
+${buildToolCatalog(p.toolNames)}
 
 === RULES ===
 1. Use only node ids listed in Current Nodes (n1, n2, ...). Never invent ids.
-2. Choose targets with target.ids (explicit) or target.filter (conditions are ANDed: tags = any match, department = category, status, color, text = substring of the content, createdWithinDays, createdAfter/createdBefore as YYYY-MM-DD). Set target.all=true only when the user clearly means every node. target.fromPrevious=true reuses the nodes of the step executed just before (execution order: structure/rewrite > tagging/due/stage/links > node generation > zoom/color/pin/archive/scan/alerts > view tools > report).
-3. You may combine several tools in one plan. View tools (arrange_view, group_view, timeline_view, orbit_view, reset_view) are mutually exclusive: use at most ONE per plan.
-4. If the user wants an order based on your judgement (importance, priority, dependency), use arrange_view with sortBy="custom" and list target.ids in the desired order.
-5. Put tool arguments in args_json as a JSON string ("{}" if none).
+2. PREFER target.filter / target.all over listing many ids. target.filter conditions are ANDed: keyword (matches content OR category OR tag — use it for "about X" / "related to X"), tags (any match), department (= category), status, color, stage, pinned, archived, text (substring of content), createdWithinDays, createdAfter/createdBefore (YYYY-MM-DD), dueWithinDays (includes overdue), overdue, noDue. Use target.ids only when you must pick nodes by judgement. target.all=true only when the user clearly means every node. target.fromPrevious=true reuses the nodes of the step executed just before (order: structure/rewrite > tagging/due/stage/links > node generation > zoom/color/pin/archive/delete/scan/alerts > view tools > report).
+3. You may combine tools. View tools (arrange_view, group_view, timeline_view, orbit_view, cluster_view, matrix_view, reset_view) are mutually exclusive: at most ONE per plan.
+4. For an order based on your judgement (importance, priority), use arrange_view sortBy="custom" with target.ids in the desired order.
+5. Put tool arguments in args_json as a JSON string ("{}" if none). Do NOT use per-node lists (colorMap, assignments, ...) when one value / one filter is enough.
 6. Write any text content yourself (merged text, split parts, summaries, comments) inside args. Keep it short, in the user's language.
 7. If the command is ambiguous, return plan: [] and set clarify to ONE short question. If it cannot be done with the tools, return plan: [] and set unsupported.
-8. message: one short HUD-style line in Japanese.
-9. Nodes may have due (YYYY-MM-DD), stage, pinned, linked (number of lines). Archived nodes are hidden from Current Nodes unless the user asks about them; to restore, use archive with restore=true and target.filter.archived=true.
-10. For questions, summaries or status reports use the report tool; base the answer ONLY on Current Nodes. Prefer one tool per intent; do not add tools the user did not ask for.
-11. When the user asks for AI judgement over many nodes (clustering, matrix scores, links, rewriting, tasks), cover every relevant node in one call; keep each text short.
+8. message: one short HUD-style line in Japanese (about 20 characters).
+9. Nodes may have due, stage, pin, links. Archived nodes are hidden unless the user asks about them; to restore use archive with restore=true and target.filter.archived=true.
+10. For questions, summaries or status reports use the report tool; answer ONLY from Current Nodes.
+11. Do not add tools the user did not ask for.
 
 === USER'S BRAIN VAULT (background knowledge & rules) ===
 ${p.brain}
 =========================================================
 
 Today: ${p.today} (Asia/Tokyo)
-Current Nodes (JSON): ${JSON.stringify(p.nodes)}
+Current Nodes (one per line):
+${p.nodesText}
 User Command: ${JSON.stringify(p.command)}`;
 }
 
@@ -246,13 +276,21 @@ User Command: ${JSON.stringify(p.command)}`;
 const isRetryable = (e: unknown) => /429|503|RESOURCE_EXHAUSTED|UNAVAILABLE/.test(String((e as any)?.message ?? e));
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function callGemini(prompt: string, deadline: number): Promise<string> {
+async function callGemini(
+  prompt: string,
+  deadline: number,
+  kind: 'standard' | 'lite',
+  schema: Schema
+): Promise<string> {
   // モデル名は model.ts が自動で見つけて覚える（404 のモデルは飛ばす）。時間制限つき
   const run = () =>
     generateWithFallback(
       ai,
-      { contents: prompt, config: { responseMimeType: 'application/json', responseSchema: planSchema, temperature: 0.1 } },
-      'standard',
+      {
+        contents: prompt,
+        config: { responseMimeType: 'application/json', responseSchema: schema, temperature: 0.1, maxOutputTokens: 4096 },
+      },
+      kind,
       { deadline }
     );
   try {
@@ -274,23 +312,38 @@ export async function createPlan(input: {
   nodes: CompressedNode[];
 }): Promise<{ plan: ExecutionPlan; warnings: string[]; cached: boolean }> {
   const deadline = Date.now() + 50_000; // 関数の実行時間上限（60秒）に収まるよう、AI待ちは合計50秒まで
-  const base = buildPrompt({ ...input, today: toDay(new Date()) });
-  const key = createHash('sha256').update(base).digest('hex');
+  const { command } = input;
+  const judgment = needsJudgment(command);
+  const subset = selectToolNames(command); // null = 全ツール
+  const nodesText = formatNodes(input.nodes, command);
+  // 単純な指令は、保管庫（背景メモ）を短くして軽いモデルで速く処理する
+  const brain = judgment ? input.brain : input.brain.slice(0, 1500);
+  const today = toDay(new Date());
 
+  const make = (names: string[] | null) => buildPrompt({ command, brain, nodesText, today, toolNames: names });
+  const key = createHash('sha256').update(make(subset)).digest('hex');
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.at < TTL_MS) {
-    return { plan: structuredClone(hit.plan), warnings: [], cached: true };
-  }
+  if (hit && Date.now() - hit.at < TTL_MS) return { plan: structuredClone(hit.plan), warnings: [], cached: true };
 
-  let prompt = base;
-  let result = { plan: EMPTY, errors: [] as string[] };
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const text = await callGemini(prompt, deadline);
-    result = parseAndValidate(text);
-    if (result.errors.length === 0 || deadline - Date.now() < 15_000) break; // 残り時間が少ないなら、やり直さず今ある分を使う
-    // 2回目は、前回の出力とエラーを見せて直させる
-    prompt = `${base}\n\n=== YOUR PREVIOUS OUTPUT WAS INVALID ===\n${text}\nErrors:\n- ${result.errors.join('\n- ')}\nReturn corrected JSON only.`;
-  }
+  const run = async (names: string[] | null, kind: 'standard' | 'lite') => {
+    const schema = buildPlanSchema(names ?? toolNames());
+    let prompt = make(names);
+    let result = { plan: EMPTY, errors: [] as string[] };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const text = await callGemini(prompt, deadline, kind, schema);
+      result = parseAndValidate(text);
+      if (result.errors.length === 0 || deadline - Date.now() < 15_000) break; // 残り時間が少ないなら、やり直さず今ある分を使う
+      // 2回目は、前回の出力とエラーを見せて直させる
+      prompt = `${make(names)}\n\n=== YOUR PREVIOUS OUTPUT WAS INVALID ===\n${text}\nErrors:\n- ${result.errors.join('\n- ')}\nReturn corrected JSON only.`;
+    }
+    return result;
+  };
+
+  let result = await run(subset, judgment ? 'standard' : 'lite');
+
+  // ツールを絞ったせいで「できない」と返ってきたときだけ、全ツールで1回やり直す
+  const gaveUp = result.plan.plan.length === 0 && !result.plan.clarify;
+  if (subset && gaveUp && deadline - Date.now() > 18_000) result = await run(null, 'standard');
 
   if (result.errors.length === 0) {
     if (cache.size > 50) cache.delete(cache.keys().next().value as string);
@@ -344,40 +397,53 @@ export function isReplayable(plan: ExecutionPlan): boolean {
 const whisperSchema: Schema = {
   type: Type.OBJECT,
   properties: {
-    message: { type: Type.STRING, description: '提案の一言。提案が無ければ空文字' },
-    command: { type: Type.STRING, nullable: true, description: 'そのまま実行できる自然文の指令' },
+    suggestions: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          message: { type: Type.STRING, description: '提案の一言（日本語・40字以内）' },
+          command: { type: Type.STRING, description: 'そのまま実行できる自然文の指令（日本語）' },
+        },
+        required: ['message', 'command'],
+      },
+    },
   },
-  required: ['message'],
+  required: ['suggestions'],
 };
 
 export async function createWhisper(input: {
   node: CompressedNode;
-  candidates: CompressedNode[];
+  related: CompressedNode[];
   brain: string;
-}): Promise<{ message: string; command: string | null } | null> {
-  const prompt = `You are JARVIS. A new node was just added to the user's thinking desk.
-Suggest AT MOST ONE useful follow-up action about it, only if clearly worthwhile: merging with a near-duplicate, linking related nodes, setting a due date, or extracting a to-do.
-If nothing is clearly worthwhile, return message "".
-- message: one short line in Japanese, JARVIS style (e.g. "サー、〇〇と統合可能です").
-- command: a natural-language Japanese command the user can run as-is. Refer to nodes by their content, never by ids.
+  today: string;
+}): Promise<{ message: string; command: string }[]> {
+  const prompt = `You are JARVIS. The user just added a new node to their thinking desk. Proactively suggest up to 3 genuinely useful follow-up actions about it. Be concrete and specific; skip generic advice. Return [] if nothing is clearly worthwhile.
+Good suggestion types: merge with a near-duplicate; link related nodes; set a due date (when the text implies one, compute it from today); turn it into a to-do / set stage; split a multi-idea node; add useful tags; notice a contradiction or missing premise with a related node; propose a next step.
+- message: one short Japanese line in JARVIS style (e.g. "サー、〇〇と統合可能です").
+- command: a natural-language Japanese command that can be run as-is. Refer to nodes by their content in 「」, NEVER by ids.
 
 === USER'S BRAIN VAULT ===
-${input.brain}
+${input.brain.slice(0, 1500)}
 ==========================
-New node: ${JSON.stringify(input.node)}
-Similar existing nodes: ${JSON.stringify(input.candidates)}`;
+Today: ${input.today}
+New node: ${formatNodes([input.node], '')}
+Related existing nodes:
+${formatNodes(input.related, '') || '(none)'}`;
 
   const res = await generateWithFallback(
     ai,
-    { contents: prompt, config: { responseMimeType: 'application/json', responseSchema: whisperSchema, temperature: 0.2 } },
-    'lite'
+    { contents: prompt, config: { responseMimeType: 'application/json', responseSchema: whisperSchema, temperature: 0.3, maxOutputTokens: 1024 } },
+    'lite',
+    { deadline: Date.now() + 25_000, perCallMs: 20_000 }
   );
   try {
     const j = JSON.parse(res.text ?? '{}');
-    const message = typeof j.message === 'string' ? j.message.trim() : '';
-    if (!message) return null;
-    return { message, command: typeof j.command === 'string' && j.command.trim() ? j.command.trim() : null };
+    return (Array.isArray(j.suggestions) ? j.suggestions : [])
+      .filter((x: any) => typeof x?.message === 'string' && typeof x?.command === 'string' && x.message.trim() && x.command.trim())
+      .slice(0, 3)
+      .map((x: any) => ({ message: x.message.trim(), command: x.command.trim() }));
   } catch {
-    return null;
+    return [];
   }
 }

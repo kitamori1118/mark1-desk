@@ -4,7 +4,9 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { supabase } from '@/lib/supabase';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import type { ViewDirective, ViewLayout } from '@/lib/desk/types';
+import type { DeskNode, ViewDirective, ViewLayout } from '@/lib/desk/types';
+import NodeSheet, { type SheetPatch } from '@/lib/desk/ui/NodeSheet';
+import { overviewSuggestions, suggestionsForNewNode, type Suggestion } from '@/lib/desk/insights';
 import { computeViewPositions } from '@/lib/desk/layoutPositions';
 import { daysUntil } from '@/lib/desk/selector';
 
@@ -61,6 +63,7 @@ const VIEW_LABEL: Record<ViewLayout, string> = {
 const freeOrbSize = () => (typeof window !== 'undefined' && window.innerWidth >= 768 ? 192 : 176);
 
 const WHISPER_KEY = 'mark1desk.whisper';
+const POS_KEY = 'mark1desk.positions.v1'; // 自由配置の位置を端末ごとに保存（リロードしても崩れない）
 /** サーバー側の上限（60秒）より少し長く待ち、それでも返らなければ画面側で打ち切る */
 const CLIENT_TIMEOUT_MS = 70_000;
 
@@ -100,8 +103,19 @@ export default function Mark1DeskPage() {
   const [macros, setMacros] = useState<Macro[]>([]);
   const [macroOpen, setMacroOpen] = useState(false);
   const [lastRun, setLastRun] = useState<{ command: string; plan: unknown } | null>(null);
-  const [whisperOn, setWhisperOn] = useState(false);
-  const [whisper, setWhisper] = useState<{ message: string; command: string | null } | null>(null);
+  const [whisperOn, setWhisperOn] = useState(true); // 先回り提案（既定ON。AIの呼び出しは関連ノードがあるときだけ・1時間に上限あり）
+  const [addSuggestions, setAddSuggestions] = useState<Suggestion[]>([]);
+  const [whisperStatus, setWhisperStatus] = useState(false); // AIが分析中
+  const [whisperNote, setWhisperNote] = useState('');
+  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
+
+  // 💡 タップで開く編集シート / タグの絞り込み / 音声入力
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const [voiceOk, setVoiceOk] = useState(false);
+  const [listening, setListening] = useState(false);
+  const recRef = useRef<any>(null);
+  const dragStart = useRef<{ id: string; pos: Pos; t: number } | null>(null);
 
   const [isDesktop, setIsDesktop] = useState(false);
   useEffect(() => {
@@ -113,7 +127,7 @@ export default function Mark1DeskPage() {
 
   useEffect(() => {
     try {
-      setWhisperOn(localStorage.getItem(WHISPER_KEY) === '1');
+      if (localStorage.getItem(WHISPER_KEY) === '0') setWhisperOn(false);
     } catch {
       /* 保存できない環境では既定のOFFのまま */
     }
@@ -137,14 +151,33 @@ export default function Mark1DeskPage() {
       }
       return !v;
     });
-    setWhisper(null);
+    setAddSuggestions([]);
   };
+
+  useEffect(() => {
+    const w = window as any;
+    setVoiceOk(!!(w.SpeechRecognition || w.webkitSpeechRecognition));
+  }, []);
 
   const orb = view ? VIEW_ORB : isDesktop ? 192 : 176;
   const compact = !!view;
   const hiddenSet = useMemo(() => new Set(view?.hiddenIds ?? []), [view]);
   const archivedCount = useMemo(() => nodes.filter((n) => n.metadata?.archived).length, [nodes]);
   const visibleNodes = useMemo(() => (showArchived ? nodes : nodes.filter((n) => !n.metadata?.archived)), [nodes, showArchived]);
+
+  const nodeTagsOf = (n: StarkNode) => (n.metadata?.tags && n.metadata.tags.length > 0 ? n.metadata.tags : [n.category]);
+  const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedId) ?? null, [nodes, selectedId]);
+
+  // 💡 先回り提案：AIを使わない見張り（期限・重複）＋ノード追加時の提案
+  const insights = useMemo(
+    () => (whisperOn ? overviewSuggestions(nodes as unknown as DeskNode[]) : []),
+    [nodes, whisperOn]
+  );
+  const visibleSuggestions = useMemo(
+    () => [...addSuggestions, ...insights].filter((s) => !dismissed.has(s.id)).slice(0, 2),
+    [addSuggestions, insights, dismissed]
+  );
+  const dismiss = (id: string) => setDismissed((prev) => new Set(prev).add(id));
 
   // 💡 線：link_nodes の線（実線）と、コア・AI生成ノードの元ノードへの線（点線）
   const edges = useMemo(() => {
@@ -237,12 +270,30 @@ export default function Mark1DeskPage() {
     if (!error && data) setMacros(data as Macro[]);
   };
 
+  const readSavedPositions = (): Record<string, Pos> => {
+    try {
+      return JSON.parse(localStorage.getItem(POS_KEY) ?? '{}');
+    } catch {
+      return {};
+    }
+  };
+
   const fetchNodes = async (forceRelayout = false) => {
     const { data: nodeData } = await supabase.from('stark_nodes').select('*').order('created_at', { ascending: false });
     if (nodeData) {
       setNodes(nodeData);
-      if (forceRelayout || Object.keys(nodePositions).length === 0) {
-        relayoutNodes(nodeData.filter((n: StarkNode) => !n.metadata?.archived));
+      const live = nodeData.filter((n: StarkNode) => !n.metadata?.archived);
+      if (forceRelayout) {
+        relayoutNodes(live);
+      } else if (Object.keys(nodePositions).length === 0) {
+        // 起動時：前回の配置を復元（無いノードだけ後で補完）
+        const saved = readSavedPositions();
+        const known: Record<string, Pos> = {};
+        live.forEach((n: StarkNode) => {
+          if (saved[n.id]) known[n.id] = saved[n.id];
+        });
+        if (Object.keys(known).length) setNodePositions(known);
+        else relayoutNodes(live);
       }
       // 位置を持たないノード（新規・アーカイブ表示用）は、ずらして配置を補完
       setNodePositions((prev) => {
@@ -260,6 +311,24 @@ export default function Mark1DeskPage() {
     }
   };
 
+  // 自由配置の位置を保存（整列表示中は一時的な位置なので保存しない）
+  useEffect(() => {
+    if (view || Object.keys(nodePositions).length === 0 || nodes.length === 0) return;
+    const t = setTimeout(() => {
+      try {
+        const ids = new Set(nodes.map((n) => n.id));
+        const keep: Record<string, Pos> = {};
+        (Object.entries(nodePositions) as [string, Pos][]).forEach(([id, p]) => {
+          if (ids.has(id)) keep[id] = p;
+        });
+        localStorage.setItem(POS_KEY, JSON.stringify(keep));
+      } catch {
+        /* 保存できない環境では何もしない */
+      }
+    }, 500);
+    return () => clearTimeout(t);
+  }, [nodePositions, nodes, view]);
+
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
       if (!data.session) {
@@ -267,7 +336,7 @@ export default function Mark1DeskPage() {
         return;
       }
       setAuthed(true);
-      fetchNodes(true);
+      fetchNodes(false);
       fetchMacros();
     });
     const { data: sub } = supabase.auth.onAuthStateChange((event) => {
@@ -345,8 +414,11 @@ export default function Mark1DeskPage() {
       opts.command !== undefined && !data.clarify && !data.unsupported
         ? (data.details ?? []).filter((d: string) => !d.startsWith('⚠')).join(' / ')
         : '';
-    const timing = data.timing
-      ? ` ⏱AI ${(data.timing.planMs / 1000).toFixed(1)}秒${data.timing.model ? `・${data.timing.model}` : ''}`
+    const t = data.timing;
+    const timing = t
+      ? t.local
+        ? ' ⚡ローカル実行（AIなし）'
+        : ` ⏱AI ${(t.planMs / 1000).toFixed(1)}秒${t.model ? `・${t.model}` : ''}`
       : '';
     setSystemLog(
       prefix +
@@ -458,24 +530,46 @@ export default function Mark1DeskPage() {
         status: 'normal',
         metadata: { tags: allTags, opacity: 1, commentMode: false },
       })
-      .select('id')
+      .select('*')
       .single();
 
-    if (!error) {
+    if (!error && created) {
+      const before = nodes; // 追加前のノード一覧（重複・関連の判定用）
       setRawInputContent('');
       setIsInputOpen(false);
       clearView(false); // 新規投入後は円形の自動整列に戻る
       await fetchNodes(true);
       setSystemLog('ORB MATRIX EXPANDED.');
 
-      // 🛰 先回り提案：似たノードがあるときだけ、サーバー側でAIを呼ぶ
-      if (whisperOn && created?.id) {
-        post({ action: 'whisper', nodeId: created.id }, false).then((d) => {
-          if (d?.whisper?.message) setWhisper(d.whisper);
-        });
+      // 🛰 先回り提案：① AIなしの提案をすぐ出す ② 関連ノードがあればAIが追加提案（サーバー側で判定）
+      if (whisperOn) {
+        const local = suggestionsForNewNode(created as unknown as DeskNode, before as unknown as DeskNode[]);
+        setAddSuggestions(local);
+        setWhisperNote('');
+        setWhisperStatus(true);
+        post({ action: 'whisper', nodeId: created.id }, false)
+          .then((d) => {
+            const ai: Suggestion[] = (d?.whispers ?? []).map((w: { message: string; command: string }, i: number) => ({
+              id: `ai:${created.id}:${i}`,
+              source: 'ai' as const,
+              message: w.message,
+              command: w.command,
+            }));
+            if (ai.length) setAddSuggestions((prev) => [...ai, ...prev].slice(0, 5));
+            else {
+              const reason: Record<string, string> = {
+                no_related: '関連するノードがまだ無いため、AIの提案はありません',
+                none: 'AIの提案はありませんでした',
+                rate_limited: 'AI提案の1時間あたりの上限に達しました',
+              };
+              setWhisperNote(d?.error ? `🛰 先回り: ${d.error}` : `🛰 ${reason[d?.reason] ?? 'AIの提案はありませんでした'}`);
+              setTimeout(() => setWhisperNote(''), 6000);
+            }
+          })
+          .finally(() => setWhisperStatus(false));
       }
     } else {
-      setSystemLog(`ERROR: ${error.message}`);
+      setSystemLog(`ERROR: ${error?.message ?? '追加に失敗しました'}`);
     }
   };
 
@@ -486,8 +580,7 @@ export default function Mark1DeskPage() {
     });
   };
 
-  const handleDeleteNode = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
+  const deleteNodeById = async (id: string) => {
     // .select() で「実際に消えた行」を受け取る。RLSに DELETE ポリシーが無いと、エラーなしで0件になる
     const { data, error } = await supabase.from('stark_nodes').delete().eq('id', id).select('id');
     if (error) {
@@ -503,13 +596,52 @@ export default function Mark1DeskPage() {
       delete copy[id];
       return copy;
     });
+    setSelectedId(null);
     await fetchNodes();
     setSystemLog('ORB EXPUNGED.');
+  };
+
+  const handleDeleteNode = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    return deleteNodeById(id);
+  };
+
+  /** 編集シートの保存（AIなし・即時）。metadata は既存値に重ねて書く */
+  const updateNode = async (id: string, columns: Record<string, unknown>, meta: Record<string, unknown>, doneMsg: string) => {
+    const node = nodes.find((n) => n.id === id);
+    if (!node) return;
+    const metadata: Record<string, unknown> = { ...(node.metadata ?? {}) };
+    Object.entries(meta).forEach(([k, v]) => {
+      if (v === null || v === '' || v === false) delete metadata[k];
+      else metadata[k] = v;
+    });
+    const { data, error } = await supabase.from('stark_nodes').update({ ...columns, metadata }).eq('id', id).select('id');
+    if (error) setSystemLog(`ERROR: 保存に失敗: ${error.message}`);
+    else if (!data || data.length === 0) setSystemLog('ERROR: 保存できませんでした（Supabase の RLS に UPDATE の許可が無い可能性）');
+    else {
+      setSelectedId(null);
+      await fetchNodes();
+      setSystemLog(doneMsg);
+    }
+  };
+
+  const saveSheet = (id: string, p: SheetPatch) =>
+    updateNode(
+      id,
+      { content: p.content, color: p.color, category: p.category },
+      { tags: p.tags, due: p.due, stage: p.stage, pinned: p.pinned },
+      'ORB UPDATED.'
+    );
+
+  const toggleArchive = (id: string) => {
+    const archived = !!nodes.find((n) => n.id === id)?.metadata?.archived;
+    return updateNode(id, {}, { archived: archived ? null : true }, archived ? 'ORB RESTORED.' : 'ORB ARCHIVED.');
   };
 
   const startDrag = (id: string, clientX: number, clientY: number) => {
     setDraggingId(id);
     const currentPos = nodePositions[id] || { x: 20, y: 20 };
+    dragStart.current = { id, pos: currentPos, t: Date.now() };
     setDragOffset({ x: clientX - currentPos.x, y: clientY - currentPos.y });
   };
 
@@ -524,7 +656,45 @@ export default function Mark1DeskPage() {
     }));
   };
 
-  const endDrag = () => setDraggingId(null);
+  // ほぼ動かさずに離した＝タップ → 編集シートを開く
+  const endDrag = () => {
+    const st = dragStart.current;
+    dragStart.current = null;
+    if (draggingId && st && st.id === draggingId) {
+      const p = nodePositions[draggingId];
+      if (p && Math.hypot(p.x - st.pos.x, p.y - st.pos.y) < 6 && Date.now() - st.t < 500) setSelectedId(draggingId);
+    }
+    setDraggingId(null);
+  };
+
+  const exportJson = () => {
+    const blob = new Blob([JSON.stringify(nodes, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `mark1-desk-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    setSystemLog('EXPORTED: 全ノードをJSONで書き出しました。');
+  };
+
+  const toggleVoice = () => {
+    if (listening) {
+      recRef.current?.stop();
+      return;
+    }
+    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SR) return;
+    const rec = new SR();
+    rec.lang = 'ja-JP';
+    rec.interimResults = true;
+    rec.continuous = false;
+    rec.onresult = (e: any) => setCommand(Array.from(e.results).map((r: any) => r[0].transcript).join(''));
+    rec.onend = () => setListening(false);
+    rec.onerror = () => setListening(false);
+    recRef.current = rec;
+    rec.start();
+    setListening(true);
+  };
 
   if (!authed) {
     return (
@@ -604,11 +774,36 @@ export default function Mark1DeskPage() {
           <Link href="/settings" className={headerBtn}>
             ⚙️ VAULT & TAGS
           </Link>
+          <button onClick={exportJson} className={headerBtn} title="全ノードをJSONで書き出し（バックアップ）">
+            ⬇
+          </button>
           <button onClick={handleLogout} className={headerBtn} title="ログアウト">
             ⏻
           </button>
         </div>
       </header>
+
+      {/* タグ絞り込み（画面だけで切り替わる。AIを使わない） */}
+      {quickSlots.length > 0 && !view && (
+        <div className="relative z-20 flex gap-1.5 overflow-x-auto px-4 py-1.5 border-b border-[#00f0ff]/15 bg-[#030712]/70">
+          {[null, ...quickSlots].map((slot) => {
+            const tag = slot ? slot.slice(1) : null;
+            const on = tagFilter === tag;
+            return (
+              <button
+                key={slot ?? 'ALL'}
+                type="button"
+                onClick={() => setTagFilter(on ? null : tag)}
+                className={`shrink-0 text-[10px] px-2.5 py-0.5 rounded-full border transition-all ${
+                  on ? 'bg-[#00f0ff]/25 border-[#00f0ff] text-white' : 'border-[#00f0ff]/30 text-[#00f0ff]/80 hover:bg-[#00f0ff]/10'
+                }`}
+              >
+                {slot ?? 'ALL'}
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       {/* 整列表示中のステータスバー */}
       {view && (
@@ -628,7 +823,7 @@ export default function Mark1DeskPage() {
       )}
 
       {/* メイン オーブ空間 */}
-      <main ref={mainRef} className="relative z-10 flex-1 w-full h-[calc(100vh-170px)] overflow-auto">
+      <main ref={mainRef} className="relative z-10 flex-1 w-full h-[calc(100vh-205px)] overflow-auto">
         {/* 整列表示のとき、スクロール範囲を確保する（下部の固定フッター分も加算） */}
         {viewLayout && (
           <div
@@ -654,7 +849,8 @@ export default function Mark1DeskPage() {
           const pos = nodePositions[node.id] || { x: 100, y: 100 };
           const isScanned = node.status === 'scanned';
           const isHighlight = node.status === 'highlight';
-          const isHidden = hiddenSet.has(node.id) && !node.metadata?.archived;
+          const filteredOut = !!tagFilter && !nodeTagsOf(node).includes(tagFilter);
+          const isHidden = (hiddenSet.has(node.id) && !node.metadata?.archived) || filteredOut;
           const isArchived = !!node.metadata?.archived;
           const commentMode = node.metadata?.commentMode;
           const comment = node.metadata?.comment;
@@ -763,6 +959,17 @@ export default function Mark1DeskPage() {
         })}
       </main>
 
+      {selectedNode && (
+        <NodeSheet
+          key={selectedNode.id}
+          node={selectedNode}
+          onClose={() => setSelectedId(null)}
+          onSave={(p) => saveSheet(selectedNode.id, p)}
+          onToggleArchive={() => toggleArchive(selectedNode.id)}
+          onDelete={() => deleteNodeById(selectedNode.id)}
+        />
+      )}
+
       {/* AIからの回答パネル（report ツール） */}
       {report && (
         <div className="fixed bottom-44 left-3 right-3 z-40 max-w-2xl mx-auto">
@@ -855,26 +1062,35 @@ export default function Mark1DeskPage() {
             )}
           </div>
 
-          {/* 🛰 先回り提案 */}
-          {whisper && (
-            <div className="flex items-center gap-2 text-[10px] md:text-xs bg-fuchsia-950/40 border border-fuchsia-400/50 rounded-xl px-3 py-1.5">
-              <span className="flex-1 text-fuchsia-200">🛰 {whisper.message}</span>
-              {whisper.command && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    const c = whisper.command as string;
-                    setWhisper(null);
-                    runCommand(c);
-                  }}
-                  className="shrink-0 border border-fuchsia-300 text-fuchsia-200 px-2 py-0.5 rounded-full hover:bg-fuchsia-400/20 active:scale-95"
+          {/* 🛰 先回り提案（💡=AIなしの即時提案 / 🛰=AIの提案） */}
+          {(visibleSuggestions.length > 0 || whisperStatus || whisperNote) && (
+            <div className="flex flex-col gap-1">
+              {whisperStatus && <div className="text-[10px] text-fuchsia-300 animate-pulse">🛰 先回り分析中…</div>}
+              {whisperNote && <div className="text-[10px] text-slate-400">{whisperNote}</div>}
+              {visibleSuggestions.map((sg) => (
+                <div
+                  key={sg.id}
+                  className="flex items-center gap-2 text-[10px] md:text-xs bg-fuchsia-950/40 border border-fuchsia-400/50 rounded-xl px-3 py-1.5"
                 >
-                  ▶ 実行
-                </button>
-              )}
-              <button type="button" onClick={() => setWhisper(null)} className="shrink-0 text-slate-400 hover:text-white px-1">
-                ✕
-              </button>
+                  <span className="flex-1 text-fuchsia-200 truncate">
+                    {sg.source === 'ai' ? '🛰' : '💡'} {sg.message}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      dismiss(sg.id);
+                      runCommand(sg.command);
+                    }}
+                    disabled={loading}
+                    className="shrink-0 border border-fuchsia-300 text-fuchsia-200 px-2 py-0.5 rounded-full hover:bg-fuchsia-400/20 active:scale-95 disabled:opacity-40"
+                  >
+                    ▶ 実行
+                  </button>
+                  <button type="button" onClick={() => dismiss(sg.id)} className="shrink-0 text-slate-400 hover:text-white px-1">
+                    ✕
+                  </button>
+                </div>
+              ))}
             </div>
           )}
 
@@ -927,6 +1143,18 @@ export default function Mark1DeskPage() {
               disabled={loading}
               className="flex-1 bg-[#0a1128] border border-[#00f0ff]/40 rounded-xl px-3.5 py-2.5 text-xs md:text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-[#00f0ff]"
             />
+            {voiceOk && !loading && (
+              <button
+                type="button"
+                onClick={toggleVoice}
+                className={`px-3 py-2.5 rounded-xl border text-sm active:scale-95 transition-all ${
+                  listening ? 'bg-rose-500/30 border-rose-400 text-rose-200 animate-pulse' : 'border-[#00f0ff]/50 text-[#00f0ff] hover:bg-[#00f0ff]/10'
+                }`}
+                title="音声で指令（日本語）"
+              >
+                {listening ? '⏹' : '🎤'}
+              </button>
+            )}
             {loading ? (
               <button
                 type="button"

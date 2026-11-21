@@ -35,6 +35,10 @@ export function matchesFilter(n: DeskNode, f: NodeFilter, now: Date): boolean {
   if (f.status && n.status !== f.status) return false;
   if (f.color && n.color !== f.color) return false;
   if (f.text && !norm(n.content).includes(norm(f.text))) return false;
+  if (f.keyword) {
+    const k = norm(f.keyword);
+    if (![n.content, n.category, ...nodeTags(n)].some((h) => norm(h).includes(k))) return false;
+  }
 
   const meta = n.metadata ?? {};
   if (f.stage && meta.stage !== f.stage) return false;
