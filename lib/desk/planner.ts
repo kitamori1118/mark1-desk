@@ -98,10 +98,13 @@ const filterSchema: Schema = {
     createdBefore: { type: Type.STRING, description: 'YYYY-MM-DD' },
     stage: { type: Type.STRING },
     pinned: { type: Type.BOOLEAN },
+    stacked: { type: Type.BOOLEAN, description: '重ねられている（スタック中の）ノード' },
     archived: { type: Type.BOOLEAN, description: 'trueでアーカイブ済みだけを対象にする' },
     dueWithinDays: { type: Type.INTEGER, description: '期限がN日以内（期限超過を含む）' },
     overdue: { type: Type.BOOLEAN },
     noDue: { type: Type.BOOLEAN },
+    hourFrom: { type: Type.INTEGER, description: '記入した時刻（日本時間の時 0〜23）がこの時以降' },
+    hourTo: { type: Type.INTEGER, description: '記入した時刻がこの時より前（1〜24）。夜=20〜24、朝=5〜9 など' },
     keyword: { type: Type.STRING, description: '本文・カテゴリ・タグのどれかに含まれる語。「〇〇に関するもの」はこれを使う' },
   },
 };
@@ -157,11 +160,14 @@ const filterZ = z.object({
   createdBefore: z.string().nullish(),
   stage: z.string().nullish(),
   pinned: z.boolean().nullish(),
+  stacked: z.boolean().nullish(),
   archived: z.boolean().nullish(),
   dueWithinDays: z.number().nullish(),
   overdue: z.boolean().nullish(),
   noDue: z.boolean().nullish(),
   keyword: z.string().nullish(),
+  hourFrom: z.number().nullish(),
+  hourTo: z.number().nullish(),
 });
 
 const targetZ = z.object({
@@ -248,7 +254,7 @@ ${buildToolCatalog(p.toolNames)}
 
 === RULES ===
 1. Use only node ids listed in Current Nodes (n1, n2, ...). Never invent ids.
-2. PREFER target.filter / target.all over listing many ids. target.filter conditions are ANDed: keyword (matches content OR category OR tag — use it for "about X" / "related to X"), tags (any match), department (= category), status, color, stage, pinned, archived, text (substring of content), createdWithinDays, createdAfter/createdBefore (YYYY-MM-DD), dueWithinDays (includes overdue), overdue, noDue. Use target.ids only when you must pick nodes by judgement. target.all=true only when the user clearly means every node. target.fromPrevious=true reuses the nodes of the step executed just before (order: structure/rewrite > tagging/due/stage/links > node generation > zoom/color/pin/archive/delete/scan/alerts > view tools > report).
+2. PREFER target.filter / target.all over listing many ids. target.filter conditions are ANDed: keyword (matches content OR category OR tag — use it for "about X" / "related to X"), tags (any match), department (= category), status, color, stage, pinned, archived, text (substring of content), createdWithinDays, createdAfter/createdBefore (YYYY-MM-DD), dueWithinDays (includes overdue), overdue, noDue, hourFrom/hourTo (hour of day the node was written, JST; night = 20-24, morning = 5-9). Use target.ids only when you must pick nodes by judgement. target.all=true only when the user clearly means every node. target.fromPrevious=true reuses the nodes of the step executed just before (order: structure/rewrite > tagging/due/stage/links > node generation > zoom/color/pin/archive/delete/scan/alerts > view tools > report).
 3. You may combine tools. View tools (arrange_view, group_view, timeline_view, orbit_view, cluster_view, matrix_view, reset_view) are mutually exclusive: at most ONE per plan.
 4. For an order based on your judgement (importance, priority), use arrange_view sortBy="custom" with target.ids in the desired order.
 5. Put tool arguments in args_json as a JSON string ("{}" if none). Do NOT use per-node lists (colorMap, assignments, ...) when one value / one filter is enough.
@@ -280,7 +286,8 @@ async function callGemini(
   prompt: string,
   deadline: number,
   kind: 'standard' | 'lite',
-  schema: Schema
+  schema: Schema,
+  signal?: AbortSignal
 ): Promise<string> {
   // モデル名は model.ts が自動で見つけて覚える（404 のモデルは飛ばす）。時間制限つき
   const run = () =>
@@ -291,7 +298,7 @@ async function callGemini(
         config: { responseMimeType: 'application/json', responseSchema: schema, temperature: 0.1, maxOutputTokens: 4096 },
       },
       kind,
-      { deadline }
+      { deadline, signal }
     );
   try {
     return (await run()).text ?? '';
@@ -310,6 +317,7 @@ export async function createPlan(input: {
   command: string;
   brain: string;
   nodes: CompressedNode[];
+  signal?: AbortSignal;
 }): Promise<{ plan: ExecutionPlan; warnings: string[]; cached: boolean }> {
   const deadline = Date.now() + 50_000; // 関数の実行時間上限（60秒）に収まるよう、AI待ちは合計50秒まで
   const { command } = input;
@@ -330,7 +338,7 @@ export async function createPlan(input: {
     let prompt = make(names);
     let result = { plan: EMPTY, errors: [] as string[] };
     for (let attempt = 0; attempt < 2; attempt++) {
-      const text = await callGemini(prompt, deadline, kind, schema);
+      const text = await callGemini(prompt, deadline, kind, schema, input.signal);
       result = parseAndValidate(text);
       if (result.errors.length === 0 || deadline - Date.now() < 15_000) break; // 残り時間が少ないなら、やり直さず今ある分を使う
       // 2回目は、前回の出力とエラーを見せて直させる

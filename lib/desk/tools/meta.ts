@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { defineTool } from '../types';
 import { daysUntil, dueOf } from '../selector';
+import { similarity } from '../similar';
 
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const CHUNK = 20;
@@ -55,10 +56,11 @@ export const setDue = defineTool({
   phase: 31,
   description: 'ノードの期限(YYYY-MM-DD)を設定・変更・解除する。本文の日付表現（「来週金曜まで」等）を今日の日付から計算して入れる',
   argsHint:
-    '{ due?: "YYYY-MM-DD"（targetの全ノードに同じ期限）, clear?: boolean（期限を外す）, assignments?: [{ id, due: "YYYY-MM-DD"|null }]（ノード別。nullで解除） }',
+    '{ due?: "YYYY-MM-DD"（targetの全ノードに同じ期限）, shiftDays?: number（今の期限から N 日ずらす。+延期 / -前倒し。期限のあるノードだけ）, clear?: boolean（期限を外す）, assignments?: [{ id, due: "YYYY-MM-DD"|null }]（ノード別。nullで解除） }',
   defaultTarget: 'none',
   argsSchema: z.object({
     due: z.string().nullish(),
+    shiftDays: z.number().int().min(-3650).max(3650).nullish(),
     clear: z.boolean().nullish(),
     assignments: z.array(z.object({ id: z.string(), due: z.string().nullish() })).max(60).nullish(),
   }),
@@ -66,6 +68,15 @@ export const setDue = defineTool({
     const work = new Map<string, string | null>();
     if (args.clear) targets.forEach((n) => work.set(n.id, null));
     else if (args.due && DAY_RE.test(args.due)) targets.forEach((n) => work.set(n.id, args.due as string));
+    else if (args.shiftDays) {
+      for (const n of targets) {
+        const cur = dueOf(n);
+        if (!cur || !DAY_RE.test(cur)) continue;
+        const d = new Date(`${cur}T00:00:00Z`);
+        d.setUTCDate(d.getUTCDate() + (args.shiftDays as number));
+        work.set(n.id, d.toISOString().slice(0, 10));
+      }
+    }
     for (const a of args.assignments ?? []) {
       const id = ctx.realId(a.id);
       if (!id) continue;
@@ -180,5 +191,47 @@ export const deleteNodes = defineTool({
       if (keep.length !== links.length) await ctx.patchNodes([n.id], { metadata: { links: keep.length ? keep : null } });
     }
     return `delete_nodes: ${gone.size}件を削除（↶ 戻す で復元できます）`;
+  },
+});
+
+/* ------------------------------------------------------------------ */
+/* find_duplicates：重複の疑いを見つけて印を付ける（AIなし）              */
+/* ------------------------------------------------------------------ */
+
+export const findDuplicates = defineTool({
+  name: 'find_duplicates',
+  phase: 71,
+  replayable: true,
+  description: '内容が近い（重複していそうな）ノードを見つけて、スキャン表示＋相手の内容のコメントを付ける。統合はしない（統合は merge_duplicates）',
+  argsHint: '{ threshold?: number（0〜1。既定0.55。大きいほど厳しい） }',
+  defaultTarget: 'all',
+  argsSchema: z.object({ threshold: z.number().min(0.2).max(1).nullish() }),
+  async run(ctx, targets, args) {
+    const th = args.threshold ?? 0.55;
+    const pairs: [string, string, number][] = [];
+    const list = targets.slice(0, 200);
+    for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length; j++) {
+        const sc = similarity(list[i].content, list[j].content);
+        if (sc >= th) pairs.push([list[i].id, list[j].id, sc]);
+      }
+    }
+    if (!pairs.length) return 'find_duplicates: 重複していそうなノードは見つかりませんでした';
+    const byId = new Map(ctx.nodes.map((n) => [n.id, n] as const));
+    const note = new Map<string, string>();
+    const short = (t: string) => (t.length > 12 ? `${t.slice(0, 12)}…` : t);
+    for (const [a, b] of pairs) {
+      if (!note.has(a)) note.set(a, `重複の可能性:「${short(byId.get(b)!.content)}」`);
+      if (!note.has(b)) note.set(b, `重複の可能性:「${short(byId.get(a)!.content)}」`);
+    }
+    const entries = [...note.entries()];
+    for (let i = 0; i < entries.length; i += CHUNK) {
+      await Promise.all(
+        entries.slice(i, i + CHUNK).map(([id, comment]) =>
+          ctx.patchNodes([id], { status: 'scanned', metadata: { commentMode: true, comment } })
+        )
+      );
+    }
+    return `find_duplicates: ${pairs.length}組・${entries.length}件に重複の可能性`;
   },
 });

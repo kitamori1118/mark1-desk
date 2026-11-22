@@ -119,6 +119,7 @@ export async function POST(request: Request) {
         refresh: result.changed,
         undoable: result.undoable,
         reports: result.reports,
+        ui: result.ui,
       });
     }
 
@@ -163,12 +164,14 @@ export async function POST(request: Request) {
     if (!plan) {
       const { compressed, idMap: map } = compressNodes(nodes, { includeArchived: ARCHIVE_WORDS.test(command) });
       idMap = map;
-      const made = await createPlan({ command, brain, nodes: compressed });
+      const made = await createPlan({ command, brain, nodes: compressed, signal: request.signal });
       plan = made.plan;
       warnings = made.warnings;
     }
     const t1 = Date.now();
-    const result = await executeDeskPlan(plan, { db, nodes, idMap, command });
+    // 画面側で中断されていたら、何も実行しない
+    if (request.signal.aborted) return NextResponse.json({ success: false, code: 'ABORTED', error: '中断されました（データは変更していません）' });
+    const result = await executeDeskPlan(plan, { db, nodes, idMap, command, signal: request.signal });
     const t2 = Date.now();
     console.log(
       `[JARVIS] "${command}" → ${plan.plan.map((p) => p.tool).join(', ') || '(no steps)'} | ${local ? 'LOCAL' : 'AI'} ${t1 - t0}ms, load ${loadMs}ms, exec ${t2 - t1}ms`
@@ -182,6 +185,8 @@ export async function POST(request: Request) {
       refresh: result.changed,
       undoable: result.undoable,
       reports: result.reports,
+      ui: result.ui,
+      aborted: result.aborted,
       clarify: plan.clarify ?? null,
       unsupported: plan.unsupported ?? null,
       timing: { local, planMs: t1 - t0, loadMs, execMs: t2 - t1, model: local ? null : getResolvedModel() },

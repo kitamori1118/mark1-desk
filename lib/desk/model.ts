@@ -21,6 +21,26 @@ export const getResolvedModel = (kind: Kind = 'standard') => resolved[kind] ?? n
 const isSkippable = (e: unknown) =>
   /404|NOT_FOUND|no longer available|is not found|limit:\s*0/i.test(String((e as any)?.message ?? e));
 
+/** 画面側の「中断」で待つのをやめる（通信自体は止められなくても、結果は使わない） */
+const abortable = <T>(p: Promise<T>, signal?: AbortSignal): Promise<T> =>
+  !signal
+    ? p
+    : new Promise<T>((resolve, reject) => {
+        const onAbort = () => reject(new Error('中断されました'));
+        if (signal.aborted) return onAbort();
+        signal.addEventListener('abort', onAbort, { once: true });
+        p.then(
+          (v) => {
+            signal.removeEventListener('abort', onAbort);
+            resolve(v);
+          },
+          (e) => {
+            signal.removeEventListener('abort', onAbort);
+            reject(e);
+          }
+        );
+      });
+
 const withTimeout = <T>(p: Promise<T>, ms: number, label: string): Promise<T> =>
   new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`${label} が ${Math.round(ms / 1000)} 秒以内に応答しませんでした`)), ms);
@@ -91,7 +111,7 @@ export async function generateWithFallback(
   ai: GoogleGenAI,
   req: { contents: string; config?: any },
   kind: Kind = 'standard',
-  opts: { deadline?: number; perCallMs?: number } = {}
+  opts: { deadline?: number; perCallMs?: number; signal?: AbortSignal } = {}
 ) {
   const candidates: string[] = [];
   const add = (n?: string | null) => n && !candidates.includes(n) && candidates.push(n);
@@ -104,10 +124,11 @@ export async function generateWithFallback(
   let lastErr: unknown;
   for (let i = 0; i < candidates.length && i < 8; i++) {
     const model = candidates[i];
+    if (opts.signal?.aborted) throw new Error('中断されました');
     if (remaining() < 3000) throw new Error('時間切れ: AIの応答待ちが長引いたため中止しました。もう一度お試しください');
     try {
       const res = await withTimeout(
-        callOnce(ai, model, req),
+        abortable(callOnce(ai, model, req), opts.signal),
         Math.min(opts.perCallMs ?? 40_000, remaining()),
         `モデル ${model}`
       );

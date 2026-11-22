@@ -8,13 +8,13 @@ import type { DeskNode, ViewDirective, ViewLayout } from '@/lib/desk/types';
 import NodeSheet, { type SheetPatch } from '@/lib/desk/ui/NodeSheet';
 import { overviewSuggestions, suggestionsForNewNode, type Suggestion } from '@/lib/desk/insights';
 import { computeViewPositions } from '@/lib/desk/layoutPositions';
-import { daysUntil } from '@/lib/desk/selector';
+import { daysUntil, toDateTime } from '@/lib/desk/selector';
 
 interface StarkNode {
   id: string;
   content: string;
   category: string;
-  color: 'cyan' | 'amber' | 'crimson' | 'emerald';
+  color: string; // cyan / blue / violet / pink / crimson / orange / amber / lime / emerald / slate
   status: string;
   metadata?: {
     tags?: string[];
@@ -26,6 +26,8 @@ interface StarkNode {
     pinned?: boolean;
     archived?: boolean;
     links?: string[]; // 線でつないだ相手
+    stack?: string; // 重ねている山のID（同じIDは一緒に動く）
+    editedAt?: string; // 本文を編集した日時
     sources?: string[]; // コア・AI生成ノードの元ノード
     ai?: boolean;
   };
@@ -43,6 +45,20 @@ interface Macro {
 }
 
 type Pos = { x: number; y: number };
+
+/** 色ごとの見た目（Tailwind は完全なクラス名が必要なので、文字列をそのまま並べている） */
+const COLOR_STYLES: Record<string, string> = {
+  cyan: 'border-[#00f0ff]/80 text-[#00f0ff] shadow-[0_0_25px_rgba(0,240,255,0.35)] bg-gradient-to-br from-[#001525]/90 to-[#0a1128]/95',
+  blue: 'border-blue-400/80 text-blue-300 shadow-[0_0_25px_rgba(59,130,246,0.4)] bg-gradient-to-br from-[#0b1633]/90 to-[#0a1128]/95',
+  violet: 'border-violet-400/80 text-violet-300 shadow-[0_0_25px_rgba(167,139,250,0.4)] bg-gradient-to-br from-[#170f2e]/90 to-[#0a1128]/95',
+  pink: 'border-pink-400/80 text-pink-300 shadow-[0_0_25px_rgba(244,114,182,0.4)] bg-gradient-to-br from-[#2a0f1f]/90 to-[#0a1128]/95',
+  crimson: 'border-rose-500 text-rose-300 shadow-[0_0_30px_rgba(244,63,94,0.5)] animate-pulse bg-gradient-to-br from-[#200008]/95 to-[#0a1128]/95',
+  orange: 'border-orange-400/80 text-orange-300 shadow-[0_0_25px_rgba(251,146,60,0.4)] bg-gradient-to-br from-[#241005]/90 to-[#0a1128]/95',
+  amber: 'border-amber-400/80 text-amber-300 shadow-[0_0_25px_rgba(251,191,36,0.35)] bg-gradient-to-br from-[#1a1500]/90 to-[#0a1128]/95',
+  lime: 'border-lime-400/80 text-lime-300 shadow-[0_0_25px_rgba(163,230,53,0.4)] bg-gradient-to-br from-[#14200a]/90 to-[#0a1128]/95',
+  emerald: 'border-emerald-400/80 text-emerald-300 shadow-[0_0_25px_rgba(52,211,153,0.35)] bg-gradient-to-br from-[#002010]/90 to-[#0a1128]/95',
+  slate: 'border-slate-400/70 text-slate-300 shadow-[0_0_18px_rgba(148,163,184,0.3)] bg-gradient-to-br from-[#141a26]/90 to-[#0a1128]/95',
+};
 
 /** 整列表示中のオーブの大きさ（スマホ幅でも2列に収まるよう少しコンパクトにする） */
 const VIEW_ORB = 148;
@@ -63,6 +79,7 @@ const VIEW_LABEL: Record<ViewLayout, string> = {
 const freeOrbSize = () => (typeof window !== 'undefined' && window.innerWidth >= 768 ? 192 : 176);
 
 const WHISPER_KEY = 'mark1desk.whisper';
+const TIME_KEY = 'mark1desk.showTime';
 const POS_KEY = 'mark1desk.positions.v1'; // 自由配置の位置を端末ごとに保存（リロードしても崩れない）
 /** サーバー側の上限（60秒）より少し長く待ち、それでも返らなければ画面側で打ち切る */
 const CLIENT_TIMEOUT_MS = 70_000;
@@ -78,6 +95,14 @@ export default function Mark1DeskPage() {
   const [rawInputContent, setRawInputContent] = useState('');
 
   const [systemLog, setSystemLog] = useState('MARK1-DESK // NEURAL ORB MATRIX ONLINE.');
+  // 現在時刻は描画中ではなく、起動後（ブラウザ側）に取得して1分ごとに更新する
+  const [now, setNow] = useState<Date | null>(null);
+  useEffect(() => {
+    setNow(new Date());
+    const id = setInterval(() => setNow(new Date()), 60_000);
+    return () => clearInterval(id);
+  }, []);
+
   const [loading, setLoading] = useState(false);
   const [loadingLabel, setLoadingLabel] = useState('');
   const [elapsed, setElapsed] = useState(0); // 実行中の経過秒数（止まっているのか待っているのか分かるように）
@@ -85,7 +110,11 @@ export default function Mark1DeskPage() {
   const cancelledRef = useRef(false);
 
   const [draggingId, setDraggingId] = useState<string | null>(null);
-  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+  const [dragIds, setDragIds] = useState<string[]>([]); // いま一緒に動かしているオーブ
+  const dragGroup = useRef<{ ids: string[]; base: Record<string, Pos>; start: { x: number; y: number } } | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set()); // Shift+クリック／選択モードで選んだオーブ
+  const [selectMode, setSelectMode] = useState(false);
+  const [showTime, setShowTime] = useState(true); // 記入した時刻をオーブに表示
   const [nodePositions, setNodePositions] = useState<Record<string, Pos>>({});
 
   // 💡 AIの「整列表示」指令。null = 自由配置
@@ -128,6 +157,7 @@ export default function Mark1DeskPage() {
   useEffect(() => {
     try {
       if (localStorage.getItem(WHISPER_KEY) === '0') setWhisperOn(false);
+      if (localStorage.getItem(TIME_KEY) === '0') setShowTime(false);
     } catch {
       /* 保存できない環境では既定のOFFのまま */
     }
@@ -141,6 +171,14 @@ export default function Mark1DeskPage() {
     const id = setInterval(() => setElapsed(Math.floor((Date.now() - t0) / 1000)), 500);
     return () => clearInterval(id);
   }, [loading]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setSelected(new Set());
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   const toggleWhisper = () => {
     setWhisperOn((v) => {
@@ -165,13 +203,24 @@ export default function Mark1DeskPage() {
   const archivedCount = useMemo(() => nodes.filter((n) => n.metadata?.archived).length, [nodes]);
   const visibleNodes = useMemo(() => (showArchived ? nodes : nodes.filter((n) => !n.metadata?.archived)), [nodes, showArchived]);
 
+  // 山（スタック）：同じ metadata.stack を持つ2件以上のオーブ
+  const stacks = useMemo(() => {
+    const m = new Map<string, string[]>();
+    visibleNodes.forEach((n) => {
+      const sid = n.metadata?.stack;
+      if (sid) m.set(sid, [...(m.get(sid) ?? []), n.id]);
+    });
+    [...m.entries()].forEach(([k, v]) => v.length < 2 && m.delete(k));
+    return m;
+  }, [visibleNodes]);
+
   const nodeTagsOf = (n: StarkNode) => (n.metadata?.tags && n.metadata.tags.length > 0 ? n.metadata.tags : [n.category]);
   const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedId) ?? null, [nodes, selectedId]);
 
   // 💡 先回り提案：AIを使わない見張り（期限・重複）＋ノード追加時の提案
   const insights = useMemo(
-    () => (whisperOn ? overviewSuggestions(nodes as unknown as DeskNode[]) : []),
-    [nodes, whisperOn]
+    () => (whisperOn && now ? overviewSuggestions(nodes as unknown as DeskNode[], now) : []),
+    [nodes, whisperOn, now]
   );
   const visibleSuggestions = useMemo(
     () => [...addSuggestions, ...insights].filter((s) => !dismissed.has(s.id)).slice(0, 2),
@@ -434,6 +483,14 @@ export default function Mark1DeskPage() {
 
     if (data.reports?.length) setReport(data.reports.join('\n\n'));
     if (data.refresh) await fetchNodes();
+    // 重ねる／ばらす（位置は端末側が持つので、ここで動かす）
+    if (data.ui?.length) {
+      if (view) clearView(true);
+      for (const a of data.ui as { type: string; groups?: { id: string; ids: string[] }[]; ids?: string[] }[]) {
+        if (a.type === 'stack' && a.groups) applyStack(a.groups);
+        if (a.type === 'spread' && a.ids) applySpread(a.ids);
+      }
+    }
     if (data.view) {
       if (data.view.layout === 'free') clearView(true);
       else applyView(data.view as ViewDirective);
@@ -479,7 +536,9 @@ export default function Mark1DeskPage() {
 
   const cancelRunning = () => {
     cancelledRef.current = true;
-    abortRef.current?.abort();
+    abortRef.current?.abort(); // サーバー側にも伝わり、まだ実行していない手順は実行されない
+    // サーバーが途中まで実行していた場合に備えて、少し待って最新の状態を読み直す
+    setTimeout(() => fetchNodes(), 1200);
   };
 
   const saveMacro = async () => {
@@ -638,33 +697,159 @@ export default function Mark1DeskPage() {
     return updateNode(id, {}, { archived: archived ? null : true }, archived ? 'ORB RESTORED.' : 'ORB ARCHIVED.');
   };
 
-  const startDrag = (id: string, clientX: number, clientY: number) => {
+  /** いっしょに動かすオーブ：選択中ならその全部、山に入っていれば山ごと、それ以外は自分だけ */
+  const groupOf = (id: string): string[] => {
+    if (selected.has(id)) return [...selected];
+    const sid = nodes.find((n) => n.id === id)?.metadata?.stack;
+    const members = sid ? stacks.get(sid) : undefined;
+    return members ?? [id];
+  };
+
+  const toggleSelect = (id: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  const startDrag = (id: string, clientX: number, clientY: number, additive = false) => {
+    if (additive) {
+      toggleSelect(id); // Shift（または Ctrl/⌘）+クリック：選択のON/OFFだけ
+      return;
+    }
+    const ids = groupOf(id);
+    const base: Record<string, Pos> = {};
+    ids.forEach((i) => (base[i] = nodePositions[i] || { x: 20, y: 20 }));
+    dragGroup.current = { ids, base, start: { x: clientX, y: clientY } };
+    setDragIds(ids);
     setDraggingId(id);
-    const currentPos = nodePositions[id] || { x: 20, y: 20 };
-    dragStart.current = { id, pos: currentPos, t: Date.now() };
-    setDragOffset({ x: clientX - currentPos.x, y: clientY - currentPos.y });
+    dragStart.current = { id, pos: base[id], t: Date.now() };
   };
 
   const moveDrag = (clientX: number, clientY: number) => {
-    if (!draggingId) return;
-    setNodePositions((prev) => ({
-      ...prev,
-      [draggingId]: {
-        x: clientX - dragOffset.x,
-        y: clientY - dragOffset.y,
-      },
-    }));
+    const g = dragGroup.current;
+    if (!draggingId || !g) return;
+    const dx = clientX - g.start.x;
+    const dy = clientY - g.start.y;
+    setNodePositions((prev) => {
+      const next = { ...prev };
+      g.ids.forEach((i) => (next[i] = { x: g.base[i].x + dx, y: g.base[i].y + dy }));
+      return next;
+    });
   };
 
-  // ほぼ動かさずに離した＝タップ → 編集シートを開く
+  // ほぼ動かさずに離した＝タップ → 編集シート（選択モード中は選択のON/OFF）
   const endDrag = () => {
     const st = dragStart.current;
     dragStart.current = null;
+    dragGroup.current = null;
     if (draggingId && st && st.id === draggingId) {
       const p = nodePositions[draggingId];
-      if (p && Math.hypot(p.x - st.pos.x, p.y - st.pos.y) < 6 && Date.now() - st.t < 500) setSelectedId(draggingId);
+      if (p && Math.hypot(p.x - st.pos.x, p.y - st.pos.y) < 6 && Date.now() - st.t < 500) {
+        if (selectMode) toggleSelect(draggingId);
+        else setSelectedId(draggingId);
+      }
     }
     setDraggingId(null);
+    setDragIds([]);
+  };
+
+  const clearSelection = () => setSelected(new Set());
+
+  /** 重ねる：位置を1か所に寄せて、少しずつずらして積む。groups が複数なら、山を並べて置く */
+  const applyStack = (groups: { id: string; ids: string[] }[]) => {
+    const width = mainRef.current?.clientWidth ?? 390;
+    const o = isDesktop ? 192 : 176;
+    setNodePositions((prev) => {
+      const next = { ...prev };
+      groups.forEach((g, gi) => {
+        let px: number;
+        let py: number;
+        if (groups.length === 1) {
+          const pts = g.ids.map((i) => prev[i]).filter(Boolean);
+          px = pts.length ? pts.reduce((a, p) => a + p.x, 0) / pts.length : 60;
+          py = pts.length ? pts.reduce((a, p) => a + p.y, 0) / pts.length : 100;
+        } else {
+          const perRow = Math.max(1, Math.floor((width - 40) / (o + 70)));
+          px = 30 + (gi % perRow) * (o + 70);
+          py = 90 + Math.floor(gi / perRow) * (o + 90);
+        }
+        g.ids.forEach((id, i) => (next[id] = { x: Math.max(10, px) + i * 9, y: Math.max(70, py) + i * 9 }));
+      });
+      return next;
+    });
+  };
+
+  /** ばらす：山の中心のまわりに円状に広げる */
+  const applySpread = (ids: string[]) => {
+    setNodePositions((prev) => {
+      const next = { ...prev };
+      const pts = ids.map((i) => prev[i]).filter(Boolean);
+      const cx = pts.length ? pts.reduce((a, p) => a + p.x, 0) / pts.length : 200;
+      const cy = pts.length ? pts.reduce((a, p) => a + p.y, 0) / pts.length : 250;
+      const r = Math.max(150, ids.length * 30);
+      ids.forEach((id, i) => {
+        const a = (i / ids.length) * Math.PI * 2 - Math.PI / 2;
+        next[id] = { x: Math.max(10, cx + Math.cos(a) * r), y: Math.max(70, cy + Math.sin(a) * r) };
+      });
+      return next;
+    });
+  };
+
+  /** 複数オーブの metadata をまとめて更新（Shift選択の操作用） */
+  const metaUpdate = async (ids: string[], meta: Record<string, unknown>) => {
+    const results = await Promise.all(
+      ids.map((id) => {
+        const n = nodes.find((x) => x.id === id);
+        if (!n) return Promise.resolve({ error: null, data: [{ id }] });
+        const metadata: Record<string, unknown> = { ...(n.metadata ?? {}) };
+        Object.entries(meta).forEach(([k, v]) => {
+          if (v === null || v === '' || v === false) delete metadata[k];
+          else metadata[k] = v;
+        });
+        return supabase.from('stark_nodes').update({ metadata }).eq('id', id).select('id');
+      })
+    );
+    const bad = results.find((r: any) => r.error || !r.data?.length);
+    if (bad) {
+      setSystemLog(`ERROR: 更新に失敗しました（${(bad as any).error?.message ?? 'RLS の UPDATE 許可を確認'}）`);
+      return false;
+    }
+    await fetchNodes();
+    return true;
+  };
+
+  const stackSelected = async () => {
+    const ids = [...selected];
+    if (ids.length < 2) return;
+    const sid = `s${Date.now().toString(36)}`;
+    if (view) clearView(true);
+    if (await metaUpdate(ids, { stack: sid })) {
+      applyStack([{ id: sid, ids }]);
+      clearSelection();
+      setSystemLog(`STACKED: ${ids.length}件を重ねました。ドラッグで一緒に動きます`);
+    }
+  };
+
+  const unstackIds = async (ids: string[]) => {
+    if (await metaUpdate(ids, { stack: null })) {
+      applySpread(ids);
+      setSystemLog('UNSTACKED: 重なりをばらしました');
+    }
+  };
+
+  const bulkDeleteSelected = async () => {
+    const ids = [...selected];
+    if (!ids.length || !window.confirm(`選択した${ids.length}件を削除しますか？`)) return;
+    const { data, error } = await supabase.from('stark_nodes').delete().in('id', ids).select('id');
+    if (error || !data?.length) {
+      setSystemLog(`ERROR: 削除できませんでした（${error?.message ?? 'RLS の DELETE 許可を確認'}）`);
+      return;
+    }
+    clearSelection();
+    await fetchNodes();
+    setSystemLog(`DELETED: ${data.length}件を削除しました`);
   };
 
   const exportJson = () => {
@@ -774,6 +959,32 @@ export default function Mark1DeskPage() {
           <Link href="/settings" className={headerBtn}>
             ⚙️ VAULT & TAGS
           </Link>
+          <button
+            onClick={() => {
+              setSelectMode((v) => !v);
+              if (selectMode) clearSelection();
+            }}
+            className={`${headerBtn} ${selectMode ? 'bg-yellow-300/20 border-yellow-300 text-yellow-200' : ''}`}
+            title="選択モード：タップで複数選んで、まとめて動かす・重ねる（PCは Shift+クリックでも選べます）"
+          >
+            ☑ 選択
+          </button>
+          <button
+            onClick={() => {
+              setShowTime((v) => {
+                try {
+                  localStorage.setItem(TIME_KEY, v ? '0' : '1');
+                } catch {
+                  /* noop */
+                }
+                return !v;
+              });
+            }}
+            className={headerBtn}
+            title="記入した時刻の表示を切り替え"
+          >
+            🕒
+          </button>
           <button onClick={exportJson} className={headerBtn} title="全ノードをJSONで書き出し（バックアップ）">
             ⬇
           </button>
@@ -782,6 +993,25 @@ export default function Mark1DeskPage() {
           </button>
         </div>
       </header>
+
+      {/* 選択中のアクション（まとめて動かす・重ねる） */}
+      {selected.size > 0 && (
+        <div className="relative z-30 flex items-center gap-2 px-4 py-1.5 text-[10px] bg-yellow-950/40 border-b border-yellow-300/40 text-yellow-100 overflow-x-auto">
+          <span className="shrink-0 font-bold">☑ {selected.size}件を選択中（ドラッグでまとめて移動）</span>
+          <button type="button" onClick={stackSelected} disabled={selected.size < 2} className="shrink-0 border border-yellow-300/70 px-2 py-0.5 rounded-full hover:bg-yellow-300/20 disabled:opacity-40">
+            ⧉ 重ねる
+          </button>
+          <button type="button" onClick={() => unstackIds([...selected])} className="shrink-0 border border-yellow-300/70 px-2 py-0.5 rounded-full hover:bg-yellow-300/20">
+            ⤢ ばらす
+          </button>
+          <button type="button" onClick={bulkDeleteSelected} className="shrink-0 border border-rose-400/70 text-rose-200 px-2 py-0.5 rounded-full hover:bg-rose-500/20">
+            削除
+          </button>
+          <button type="button" onClick={clearSelection} className="shrink-0 ml-auto text-slate-300 hover:text-white px-1">
+            ✕ 選択解除
+          </button>
+        </div>
+      )}
 
       {/* タグ絞り込み（画面だけで切り替わる。AIを使わない） */}
       {quickSlots.length > 0 && !view && (
@@ -823,7 +1053,16 @@ export default function Mark1DeskPage() {
       )}
 
       {/* メイン オーブ空間 */}
-      <main ref={mainRef} className="relative z-10 flex-1 w-full h-[calc(100vh-205px)] overflow-auto">
+      <main
+        ref={mainRef}
+        className="relative z-10 flex-1 w-full h-[calc(100vh-205px)] overflow-auto"
+        onMouseDown={(e) => {
+          if (e.target === e.currentTarget) clearSelection();
+        }}
+        onTouchStart={(e) => {
+          if (e.target === e.currentTarget) clearSelection();
+        }}
+      >
         {/* 整列表示のとき、スクロール範囲を確保する（下部の固定フッター分も加算） */}
         {viewLayout && (
           <div
@@ -859,7 +1098,7 @@ export default function Mark1DeskPage() {
 
           // 期限バッジ（AIを使わず、画面側で常に計算する）
           const due = node.metadata?.due;
-          const left = due ? daysUntil(due, new Date()) : NaN;
+          const left = due && now ? daysUntil(due, now) : NaN;
           const done = node.metadata?.stage === '完了';
           const dueClass =
             Number.isNaN(left) || done
@@ -870,19 +1109,20 @@ export default function Mark1DeskPage() {
               ? 'text-amber-300 border-amber-400'
               : 'text-slate-300';
 
-          const orbColor =
-            node.color === 'amber'
-              ? 'border-amber-400/80 text-amber-300 shadow-[0_0_25px_rgba(251,191,36,0.35)] bg-gradient-to-br from-[#1a1500]/90 to-[#0a1128]/95'
-              : node.color === 'crimson'
-              ? 'border-rose-500 text-rose-300 shadow-[0_0_30px_rgba(244,63,94,0.5)] animate-pulse bg-gradient-to-br from-[#200008]/95 to-[#0a1128]/95'
-              : node.color === 'emerald'
-              ? 'border-emerald-400/80 text-emerald-300 shadow-[0_0_25px_rgba(52,211,153,0.35)] bg-gradient-to-br from-[#002010]/90 to-[#0a1128]/95'
-              : 'border-[#00f0ff]/80 text-[#00f0ff] shadow-[0_0_25px_rgba(0,240,255,0.35)] bg-gradient-to-br from-[#001525]/90 to-[#0a1128]/95';
+          const orbColor = COLOR_STYLES[node.color] ?? COLOR_STYLES.cyan;
+
+          // 山（スタック）：先頭が一番手前。ドラッグ中は全員を最前面に
+          const stackIds = node.metadata?.stack ? stacks.get(node.metadata.stack) : undefined;
+          const stackIdx = stackIds ? stackIds.indexOf(node.id) : -1;
+          const inDrag = dragIds.includes(node.id);
+          const stackZ = inDrag ? 60 + (stackIds ? stackIds.length - stackIdx : 0) : stackIds ? 10 + (stackIds.length - stackIdx) : undefined;
+          const isSelected = selected.has(node.id);
+          const isDone = node.metadata?.stage === '完了';
 
           return (
             <div
               key={node.id}
-              onMouseDown={(e) => startDrag(node.id, e.clientX, e.clientY)}
+              onMouseDown={(e) => startDrag(node.id, e.clientX, e.clientY, e.shiftKey || e.ctrlKey || e.metaKey)}
               onTouchStart={(e) => {
                 if (e.touches[0]) startDrag(node.id, e.touches[0].clientX, e.touches[0].clientY);
               }}
@@ -892,11 +1132,12 @@ export default function Mark1DeskPage() {
                 transform: `translate(${pos.x}px, ${pos.y}px)`,
                 opacity: isHidden ? 0 : opacity,
                 pointerEvents: isHidden ? 'none' : undefined,
+                zIndex: stackZ,
               }}
               // 💡 まん丸ではなく「四角めで角が丸い」形（rounded-[28px]）。移動はドラッグ中だけアニメ無し
               className={`absolute top-0 left-0 cursor-grab active:cursor-grabbing rounded-[28px] backdrop-blur-2xl border flex flex-col items-center justify-center p-3 text-center ${
-                draggingId === node.id ? '' : 'transition-[transform,opacity,box-shadow] duration-500 ease-out motion-reduce:transition-none'
-              } ${orbColor} ${isArchived ? 'border-dashed' : ''} ${
+                inDrag ? '' : 'transition-[transform,opacity,box-shadow] duration-500 ease-out motion-reduce:transition-none'
+              } ${orbColor} ${isArchived ? 'border-dashed' : ''} ${isSelected ? 'ring-2 ring-yellow-300' : ''} ${
                 draggingId === node.id
                   ? 'z-40 scale-110 shadow-[0_0_40px_rgba(0,240,255,0.7)]'
                   : isHighlight
@@ -906,7 +1147,52 @@ export default function Mark1DeskPage() {
                   : 'z-10'
               }`}
             >
-              {node.metadata?.pinned && <span className="absolute top-1.5 left-3 text-[10px]">📌</span>}
+              {/* 左上：編集（✎）／完了トグル（✓）／ピンの印 */}
+              <div className="absolute top-1.5 left-2 flex items-center gap-1">
+                <button
+                  type="button"
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onTouchStart={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setSelectedId(node.id);
+                  }}
+                  className="text-[10px] leading-none px-1.5 py-1 rounded-full bg-black/50 text-slate-300 hover:text-white"
+                  title="編集（本文・期限・色など）"
+                >
+                  ✎
+                </button>
+                <button
+                  type="button"
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onTouchStart={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    updateNode(node.id, {}, { stage: isDone ? '未着手' : '完了' }, isDone ? 'REOPENED.' : 'DONE.');
+                  }}
+                  className={`text-[10px] leading-none px-1.5 py-1 rounded-full bg-black/50 ${isDone ? 'text-emerald-300' : 'text-slate-400 hover:text-emerald-300'}`}
+                  title={isDone ? '未着手に戻す' : '完了にする'}
+                >
+                  ✓
+                </button>
+                {node.metadata?.pinned && <span className="text-[10px]">📌</span>}
+              </div>
+              {isSelected && <span className="absolute -top-2 -right-2 text-[11px] bg-yellow-300 text-black rounded-full w-5 h-5 flex items-center justify-center font-bold">✔</span>}
+              {stackIds && stackIdx === 0 && (
+                <button
+                  type="button"
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onTouchStart={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    unstackIds(stackIds);
+                  }}
+                  className="absolute -bottom-3 left-1/2 -translate-x-1/2 text-[9px] px-2 py-0.5 rounded-full bg-fuchsia-950/90 border border-fuchsia-300 text-fuchsia-200 hover:bg-fuchsia-500/30 whitespace-nowrap"
+                  title="重なりをばらす"
+                >
+                  ×{stackIds.length} ⤢ ばらす
+                </button>
+              )}
 
               {/* タグ表示 */}
               <div className="flex flex-wrap justify-center gap-1 mb-1 max-w-full overflow-hidden max-h-[38px]">
@@ -935,6 +1221,10 @@ export default function Mark1DeskPage() {
                   )}
                   {due && <span className={`px-1 rounded border ${dueClass}`}>📅 {due.slice(5).replace('-', '/')}</span>}
                 </div>
+              )}
+
+              {showTime && (
+                <div className="mt-0.5 text-[8px] text-slate-500 tracking-wide">🕒 {toDateTime(node.created_at).slice(5).replace('-', '/')}</div>
               )}
 
               {/* コメントモード（スキャン・期限アラートの解説オーバーレイ） */}
@@ -1139,7 +1429,7 @@ export default function Mark1DeskPage() {
               type="text"
               value={command}
               onChange={(e) => setCommand(e.target.value)}
-              placeholder="JARVIS指令 (例: 期限が近いものを教えて / 優先度マトリクスにして / テーマごとにまとめて)..."
+              placeholder="指令 (例: タスクを重ねて / 夜に書いたものを一覧 / 期限を明日に / 今日やること)..."
               disabled={loading}
               className="flex-1 bg-[#0a1128] border border-[#00f0ff]/40 rounded-xl px-3.5 py-2.5 text-xs md:text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-[#00f0ff]"
             />
@@ -1157,6 +1447,7 @@ export default function Mark1DeskPage() {
             )}
             {loading ? (
               <button
+                key="cancel"
                 type="button"
                 onClick={cancelRunning}
                 className="bg-rose-500/20 border border-rose-400 text-rose-200 px-5 py-2.5 rounded-xl text-xs md:text-sm font-bold tracking-wider hover:bg-rose-500/30 active:scale-95 transition-all"
@@ -1165,6 +1456,7 @@ export default function Mark1DeskPage() {
               </button>
             ) : (
               <button
+                key="exec"
                 type="submit"
                 className="bg-[#00f0ff]/20 border border-[#00f0ff] text-[#00f0ff] px-5 py-2.5 rounded-xl text-xs md:text-sm font-bold tracking-wider hover:bg-[#00f0ff]/30 active:scale-95 transition-all"
               >

@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { DESK_COLORS, defineTool } from '../types';
 import type { DeskNode, NodePatch } from '../types';
 
-const colorZ = z.enum(['cyan', 'amber', 'crimson', 'emerald']);
+const colorZ = z.enum(DESK_COLORS);
 const CHUNK = 20;
 
 /* ------------------------------------------------------------------ */
@@ -23,7 +23,7 @@ export const spectrumShift = defineTool({
   phase: 50,
   description: 'ノードの発光色・透明度を変える。部署別／状態別／経過日数別の自動色分けや、AIの判断による個別配色にも使う',
   argsHint:
-    "{ color?: 'cyan'|'amber'|'crimson'|'emerald'（対象に一括適用）, opacity?: 0〜1, by?: 'category'|'status'|'age'（グループごとに自動配色。全ノード対象）, colorMap?: [{ id, color }]（ノード別に色を指定。緊急度順などAI判断の配色） }",
+    "{ color?: 'cyan'|'blue'|'violet'|'pink'|'crimson'|'orange'|'amber'|'lime'|'emerald'|'slate'（対象に一括適用）, opacity?: 0〜1, by?: 'category'|'status'|'age'（グループごとに自動配色。全ノード対象）, colorMap?: [{ id, color }]（ノード別に色を指定。緊急度順などAI判断の配色） }",
   defaultTarget: 'none',
   argsSchema: z
     .object({
@@ -141,7 +141,7 @@ export const autoTag = defineTool({
   phase: 30,
   description: 'ノードにタグや期限(YYYY-MM-DD)を付ける。本文から期限を読み取って付けるのにも使う（時期ごとの並べ替えの前処理）',
   argsHint:
-    '{ tags?: string[]（対象全部に同じタグを付ける）, assignments?: [{ id, tags?: string[], due?: "YYYY-MM-DD" }]（ノード別に付ける）, replace?: boolean（trueで既存タグを置き換え） }',
+    '{ tags?: string[]（対象全部に同じタグを付ける）, remove?: string[]（対象からこのタグを外す）, assignments?: [{ id, tags?: string[], due?: "YYYY-MM-DD" }]（ノード別に付ける）, replace?: boolean（trueで既存タグを置き換え） }',
   defaultTarget: 'none',
   argsSchema: z.object({
     tags: z.array(z.string()).nullish(),
@@ -149,10 +149,13 @@ export const autoTag = defineTool({
       .array(z.object({ id: z.string(), tags: z.array(z.string()).nullish(), due: z.string().nullish() }))
       .nullish(),
     replace: z.boolean().nullish(),
+    remove: z.array(z.string()).nullish(),
   }),
   async run(ctx, targets, args) {
     const byId = new Map(ctx.nodes.map((n) => [n.id, n] as const));
     const work = new Map<string, { tags: string[]; due?: string }>();
+    const removal = new Set((args.remove ?? []).map((t) => t.replace(/^@/, '').trim()).filter(Boolean));
+    if (removal.size) for (const n of targets) work.set(n.id, { tags: [] });
 
     if (args.tags?.length) for (const n of targets) work.set(n.id, { tags: args.tags });
     for (const a of args.assignments ?? []) {
@@ -169,7 +172,8 @@ export const autoTag = defineTool({
         entries.slice(i, i + CHUNK).map(async ([id, w]) => {
           const n = byId.get(id)!;
           const base = args.replace ? [] : Array.isArray(n.metadata.tags) ? n.metadata.tags.map(String) : [n.category];
-          const tags = [...new Set([...base, ...w.tags.map((t) => t.trim()).filter(Boolean)])];
+          let tags = [...new Set([...base, ...w.tags.map((t) => t.trim()).filter(Boolean)])].filter((t) => !removal.has(t));
+          if (tags.length === 0) tags = [n.category];
           const metadata: Record<string, any> = { tags };
           if (w.due && /^\d{4}-\d{2}-\d{2}$/.test(w.due)) metadata.due = w.due;
           await ctx.patchNodes([id], { metadata });

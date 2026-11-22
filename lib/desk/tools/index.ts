@@ -3,7 +3,8 @@ import { autoTag, diagnosticScan, spectrumShift, zoom } from './basic';
 import { crystallizeCore, mergeDuplicates, splitNode } from './structure';
 import { arrangeView, clusterView, groupView, matrixView, orbitView, resetView, timelineView } from './view';
 import { linkNodes, unlinkNodes } from './links';
-import { archiveNodes, deadlineAlert, deleteNodes, pinNodes, setDue, setStage } from './meta';
+import { archiveNodes, deadlineAlert, deleteNodes, findDuplicates, pinNodes, setDue, setStage } from './meta';
+import { stackNodes, unstackNodes } from './stack';
 import { expandIdeas, extractActions, report, rewriteNode } from './ai';
 
 /**
@@ -31,8 +32,11 @@ export const ALL_TOOLS: ToolDef[] = [
   pinNodes,
   archiveNodes,
   deleteNodes,
+  stackNodes,
+  unstackNodes,
   diagnosticScan,
   deadlineAlert,
+  findDuplicates,
   // 整列表示（1回の指令に1つだけ）
   arrangeView,
   groupView,

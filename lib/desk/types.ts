@@ -1,6 +1,7 @@
 import type { z, ZodTypeAny } from 'zod';
 
-export const DESK_COLORS = ['cyan', 'amber', 'crimson', 'emerald'] as const;
+// 色は DB 上は文字列なので、増やしても移行は不要。見た目の定義は app/page.tsx の COLOR_STYLES と NodeSheet にある
+export const DESK_COLORS = ['cyan', 'blue', 'violet', 'pink', 'crimson', 'orange', 'amber', 'lime', 'emerald', 'slate'] as const;
 export type DeskColor = (typeof DESK_COLORS)[number];
 
 /** stark_nodes の1行（metadata は必ずオブジェクトに正規化して扱う） */
@@ -31,6 +32,9 @@ export interface NodeFilter {
   overdue?: boolean | null; // 期限超過のみ
   noDue?: boolean | null; // 期限なしのみ
   keyword?: string | null; // 本文・カテゴリ・タグのどれかに含まれる（「〇〇に関するもの」）
+  hourFrom?: number | null; // 記入した時刻（日本時間の時）がこの時以降 0〜23
+  hourTo?: number | null; // 記入した時刻がこの時より前 1〜24（hourFrom〜hourTo の範囲）
+  stacked?: boolean | null; // 重ねられている（スタック中の）ノード
 }
 
 /** ツールの対象指定 */
@@ -77,6 +81,12 @@ export interface ViewDirective {
   centerId?: string;
 }
 
+/* ---------- 画面だけに作用する指令（位置は端末側が持つので、サーバーは「こうして」と伝えるだけ） ---------- */
+
+export type UiAction =
+  | { type: 'stack'; groups: { id: string; ids: string[] }[] } // 各グループを1か所に重ねる
+  | { type: 'spread'; ids: string[] }; // 重なりをばらして広げる
+
 /* ---------- ツール実行コンテキスト ---------- */
 
 export interface NodePatch {
@@ -106,6 +116,8 @@ export interface ToolContext {
   today: Date;
   /** report ツールが積む「AIからの回答」テキスト */
   reports: string[];
+  /** 画面側で実行してほしい指令（重ねる・ばらす） */
+  ui: UiAction[];
   /** 短縮ID(n1) → 実ID。存在しないIDは null */
   realId(id: string): string | null;
   patchNodes(ids: string[], patch: NodePatch): Promise<void>;

@@ -6,10 +6,11 @@ import React, { useState } from 'react';
 
 export interface SheetNode {
   id: string;
+  created_at?: string;
   content: string;
   category: string;
   color: string;
-  metadata?: { tags?: string[]; due?: string; stage?: string; pinned?: boolean; archived?: boolean };
+  metadata?: { tags?: string[]; due?: string; stage?: string; pinned?: boolean; archived?: boolean; editedAt?: string };
 }
 
 export interface SheetPatch {
@@ -24,11 +25,29 @@ export interface SheetPatch {
 
 const COLORS: [string, string][] = [
   ['cyan', '#00f0ff'],
-  ['amber', '#fbbf24'],
+  ['blue', '#3b82f6'],
+  ['violet', '#a78bfa'],
+  ['pink', '#f472b6'],
   ['crimson', '#f43f5e'],
+  ['orange', '#fb923c'],
+  ['amber', '#fbbf24'],
+  ['lime', '#a3e635'],
   ['emerald', '#34d399'],
+  ['slate', '#94a3b8'],
 ];
 const STAGES = ['未着手', '進行中', '完了'];
+
+const fmtJst = (iso?: string) =>
+  iso ? new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+
+/** 端末のローカル日付で YYYY-MM-DD（ボタン操作の中でだけ呼ぶ） */
+const ymdLocal = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const shiftDay = (base: string, n: number) => {
+  const d = base ? new Date(`${base}T00:00:00`) : new Date();
+  d.setDate(d.getDate() + n);
+  return ymdLocal(d);
+};
 
 const field =
   'bg-[#030712] border border-[#00f0ff]/40 rounded-xl px-3 py-2 text-xs md:text-sm text-slate-100 focus:outline-none focus:border-[#00f0ff]';
@@ -95,10 +114,34 @@ export default function NodeSheet({
         />
 
         <div className="grid grid-cols-2 gap-3">
-          <label className="flex flex-col gap-1 text-[10px] text-slate-400">
-            期限
-            <input type="date" value={due} onChange={(e) => setDue(e.target.value)} className={field} />
-          </label>
+          <div className="flex flex-col gap-1 text-[10px] text-slate-400">
+            <label className="flex flex-col gap-1">
+              期限
+              <input type="date" value={due} onChange={(e) => setDue(e.target.value)} className={field} />
+            </label>
+            <div className="flex flex-wrap gap-1">
+              {[
+                ['今日', () => ymdLocal(new Date())],
+                ['明日', () => shiftDay(ymdLocal(new Date()), 1)],
+                ['来週', () => shiftDay(ymdLocal(new Date()), 7)],
+                ['−1日', () => shiftDay(due, -1)],
+                ['+1日', () => shiftDay(due, 1)],
+                ['+1週', () => shiftDay(due, 7)],
+              ].map(([label, fn]) => (
+                <button
+                  key={label as string}
+                  type="button"
+                  onClick={() => setDue((fn as () => string)())}
+                  className="px-2 py-0.5 rounded-full border border-[#00f0ff]/40 text-[#00f0ff] hover:bg-[#00f0ff]/15 text-[10px]"
+                >
+                  {label as string}
+                </button>
+              ))}
+              <button type="button" onClick={() => setDue('')} className="px-2 py-0.5 rounded-full border border-rose-400/50 text-rose-300 hover:bg-rose-500/15 text-[10px]">
+                クリア
+              </button>
+            </div>
+          </div>
           <label className="flex flex-col gap-1 text-[10px] text-slate-400">
             ステージ
             <select value={stage} onChange={(e) => setStage(e.target.value)} className={field}>
@@ -112,7 +155,12 @@ export default function NodeSheet({
           </label>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="text-[10px] text-slate-500 leading-relaxed">
+          {node.created_at && <div>🕒 記入: {fmtJst(node.created_at)}</div>}
+          {m.editedAt && <div>✎ 編集: {fmtJst(m.editedAt)}</div>}
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
           <span className="text-[10px] text-slate-400">色</span>
           {COLORS.map(([name, hex]) => (
             <button
@@ -120,7 +168,7 @@ export default function NodeSheet({
               type="button"
               onClick={() => setColor(name)}
               style={{ backgroundColor: hex }}
-              className={`w-7 h-7 rounded-full border-2 ${color === name ? 'border-white scale-110' : 'border-transparent opacity-60'}`}
+              className={`w-6 h-6 rounded-full border-2 ${color === name ? 'border-white scale-110' : 'border-transparent opacity-60'}`}
               aria-label={name}
             />
           ))}

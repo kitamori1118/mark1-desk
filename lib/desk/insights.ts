@@ -56,7 +56,8 @@ export function suggestionsForNewNode(node: DeskNode, others: DeskNode[]): Sugge
 }
 
 /** 開いているときに常に見張る提案（期限切れ・重複の疑い） */
-export function overviewSuggestions(nodes: DeskNode[], now = new Date()): Suggestion[] {
+// now は呼び出し側から渡す（描画中に new Date() を読むと Next.js のプリレンダーでエラーになるため）
+export function overviewSuggestions(nodes: DeskNode[], now: Date): Suggestion[] {
   const live = nodes.filter((n) => !isArchived(n));
   const out: Suggestion[] = [];
 

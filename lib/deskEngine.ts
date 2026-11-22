@@ -26,7 +26,7 @@ function mergeMeta(base: Record<string, any>, patch: Record<string, any>) {
 
 export async function executeDeskPlan(
   executionPlan: ExecutionPlan,
-  init: { db: SupabaseClient; nodes: DeskNode[]; idMap: Map<string, string>; command?: string; record?: boolean }
+  init: { db: SupabaseClient; nodes: DeskNode[]; idMap: Map<string, string>; command?: string; record?: boolean; signal?: AbortSignal }
 ) {
   const db = init.db; // ログイン中のユーザーとして動くDBクライアント（RLSが効く）
   let dirty = false;
@@ -40,6 +40,7 @@ export async function executeDeskPlan(
     view: null,
     today: new Date(),
     reports: [],
+    ui: [],
 
     realId(id) {
       const mapped = init.idMap.get(id);
@@ -52,7 +53,9 @@ export async function executeDeskPlan(
       const nodes = [...new Set(ids)].map((id) => map.get(id)).filter((n): n is DeskNode => !!n);
       if (!nodes.length) return;
 
-      const { metadata, ...rest } = patch;
+      const { metadata: metaPatch, ...rest } = patch;
+      // 本文を書き換えたら、編集した時刻も記録しておく（表示・並べ替えに使う）
+      const metadata = patch.content !== undefined ? { ...(metaPatch ?? {}), editedAt: new Date().toISOString() } : metaPatch;
       const columns = clean(rest);
 
       // metadata を触らないなら1回のUPDATEで済む
@@ -133,7 +136,14 @@ export async function executeDeskPlan(
   const logs: string[] = [];
   let failures = 0;
 
+  let aborted = false;
   for (const { item, tool } of steps) {
+    // 画面側で「中断」されたら、まだ実行していないステップは行わない
+    if (init.signal?.aborted) {
+      aborted = true;
+      logs.push('⏹ 中断されたため、残りのステップは実行しませんでした');
+      break;
+    }
     const targets = resolveTargets(ctx, item.target, tool.defaultTarget);
     try {
       logs.push(await tool.run(ctx, targets, item.args));
@@ -161,6 +171,8 @@ export async function executeDeskPlan(
     view: ctx.view, // 整列表示の指令（無ければ null ＝ 今の表示のまま）
     changed: dirty, // true ならクライアントはノードを再取得する
     reports: ctx.reports, // report ツールの回答
+    ui: ctx.ui, // 画面側で実行する指令（重ねる・ばらす）
+    aborted,
     undoable,
   };
 }

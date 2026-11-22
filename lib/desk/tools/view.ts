@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { defineTool } from '../types';
 import type { DeskNode, ToolContext, ViewDirective, ViewGroup } from '../types';
-import { dueOf, nodeTags, toDay } from '../selector';
+import { dueOf, hourOf, nodeTags, toDay, toTime } from '../selector';
 
 /*
  * 表示系ツールは DB を変更しない。「どのノードを・どの順で・どうまとめて並べるか」を
@@ -9,7 +9,7 @@ import { dueOf, nodeTags, toDay } from '../selector';
  * レイアウト系は1回の指令につき1つだけ有効（先に実行されたものが優先）。
  */
 
-const sortKeyZ = z.enum(['created_at', 'due', 'category', 'color', 'status', 'length', 'custom']);
+const sortKeyZ = z.enum(['created_at', 'updated', 'time_of_day', 'due', 'category', 'color', 'status', 'length', 'custom']);
 type SortKey = z.infer<typeof sortKeyZ>;
 const orderZ = z.enum(['asc', 'desc']);
 
@@ -28,6 +28,8 @@ function sortNodes(nodes: DeskNode[], by: SortKey, order: 'asc' | 'desc'): DeskN
 
   const cmp: Record<Exclude<SortKey, 'custom'>, (a: DeskNode, b: DeskNode) => number> = {
     created_at: (a, b) => time(a.created_at) - time(b.created_at),
+    updated: (a, b) => time(a.metadata?.editedAt ?? a.created_at) - time(b.metadata?.editedAt ?? b.created_at),
+    time_of_day: (a, b) => toTime(a.created_at).localeCompare(toTime(b.created_at)), // 日付を無視して、記入した時刻の早い順
     due: (a, b) => (dueOf(a) || '9999-99-99').localeCompare(dueOf(b) || '9999-99-99'),
     category: (a, b) => a.category.localeCompare(b.category, 'ja'),
     color: (a, b) => a.color.localeCompare(b.color),
@@ -58,14 +60,15 @@ export const arrangeView = defineTool({
   name: 'arrange_view',
   phase: 80,
   description:
-    '対象ノードを縦一覧またはグリッドに整列して表示し、並び順も指定できる。「絞り込んだものを一覧にして」「〇〇順に並べて」に使う。対象外のノードは隠す／薄くする',
+    '対象ノードを縦一覧またはグリッドに整列して表示し、並び順も指定できる。「絞り込んだものを一覧にして」「〇〇順に並べて」「最新5件」「記入した時間順」に使う。対象外のノードは隠す／薄くする',
   argsHint:
-    "{ layout?: 'list'|'grid'（既定list）, sortBy?: 'created_at'|'due'|'category'|'color'|'status'|'length'|'custom'（既定created_at）, order?: 'asc'|'desc', hideOthers?: boolean（既定true）, title?: string }。重要度順・優先度順などAIの判断で並べるときは sortBy='custom' にして target.ids を希望の順に並べる",
+    "{ layout?: 'list'|'grid'（既定list）, sortBy?: 'created_at'（記入した日時順）|'updated'（編集した日時順）|'time_of_day'（日付を無視した記入時刻順）|'due'|'category'|'color'|'status'|'length'|'custom'（既定created_at）, order?: 'asc'|'desc', limit?: number（先頭からN件だけ表示）, hideOthers?: boolean（既定true）, title?: string }。重要度順・優先度順などAIの判断で並べるときは sortBy='custom' にして target.ids を希望の順に並べる",
   defaultTarget: 'all',
   argsSchema: z.object({
     layout: z.enum(['list', 'grid']).nullish(),
     sortBy: sortKeyZ.nullish(),
     order: orderZ.nullish(),
+    limit: z.number().int().min(1).max(500).nullish(),
     hideOthers: z.boolean().nullish(),
     title: z.string().nullish(),
   }),
@@ -73,22 +76,21 @@ export const arrangeView = defineTool({
     if (!targets.length) return 'arrange_view: 対象ノードなし';
     const by = args.sortBy ?? 'created_at';
     const sorted0 = sortNodes(targets, by, args.order ?? 'asc');
-    const sorted = by === 'custom' ? sorted0 : pinFirst(sorted0);
+    const sorted1 = by === 'custom' ? sorted0 : pinFirst(sorted0);
+    const sorted = args.limit ? sorted1.slice(0, args.limit) : sorted1;
     return commitView(
       ctx,
       {
         layout: args.layout ?? 'list',
         title: args.title ?? undefined,
         order: sorted.map((n) => n.id),
-        hiddenIds: hiddenOf(ctx, targets, args.hideOthers),
+        hiddenIds: hiddenOf(ctx, sorted, args.hideOthers),
       },
       `arrange_view: ${sorted.length}件を${args.layout === 'grid' ? 'グリッド' : '一覧'}表示`
     );
   },
 });
 
-/* ------------------------------------------------------------------ */
-/* group_view：カテゴリ・色・状態・タグごとにまとめる                      */
 /* ------------------------------------------------------------------ */
 
 export const groupView = defineTool({
@@ -275,16 +277,27 @@ function bucketOf(day: string, bucket: 'day' | 'week' | 'month'): { key: string;
   return { key: day, label: day };
 }
 
+/** 時間帯（日付は無視して、記入した時刻だけで分ける） */
+const DAYPARTS: { name: string; from: number; to: number }[] = [
+  { name: '深夜', from: 0, to: 5 },
+  { name: '朝', from: 5, to: 9 },
+  { name: '午前', from: 9, to: 12 },
+  { name: '午後', from: 12, to: 17 },
+  { name: '夕方', from: 17, to: 20 },
+  { name: '夜', from: 20, to: 24 },
+];
+
 export const timelineView = defineTool({
   name: 'timeline_view',
   phase: 82,
-  description: 'ノードを作成日または期限(metadata.due)の時期ごと（日・週・月）に区切って時系列に並べる。「時期ごとに」「古い順に」「期限順に」に使う',
+  description:
+    'ノードを記入した日時（または編集日時・期限）の時期ごとに区切って時系列に並べる。日・週・月・時間（1時間ごと）・時間帯（朝/午前/午後/夕方/夜）に対応。「時期ごとに」「時間別に」「時間帯ごとに」「古い順に」「期限順に」に使う',
   argsHint:
-    "{ by?: 'created_at'|'due'（既定created_at）, bucket?: 'day'|'week'|'month'（既定week）, order?: 'asc'|'desc'（既定asc）, hideOthers?: boolean（既定true）, title?: string }。期限が未設定のノードは「期限なし」にまとまる。期限を使うなら先に auto_tag の assignments で due を付ける",
+    "{ by?: 'created_at'（記入日時）|'updated'（編集日時）|'due'（期限）（既定created_at）, bucket?: 'day'|'week'|'month'|'hour'|'daypart'（既定week。hour=1時間ごと / daypart=朝・午前・午後・夕方・夜などの時間帯。hour と daypart は due では使えない）, order?: 'asc'|'desc'（既定asc）, hideOthers?: boolean（既定true）, title?: string }。期限が未設定のノードは「期限なし」にまとまる。期限を使うなら先に auto_tag の assignments か set_due で期限を付ける",
   defaultTarget: 'all',
   argsSchema: z.object({
-    by: z.enum(['created_at', 'due']).nullish(),
-    bucket: z.enum(['day', 'week', 'month']).nullish(),
+    by: z.enum(['created_at', 'updated', 'due']).nullish(),
+    bucket: z.enum(['day', 'week', 'month', 'hour', 'daypart']).nullish(),
     order: orderZ.nullish(),
     hideOthers: z.boolean().nullish(),
     title: z.string().nullish(),
@@ -292,14 +305,30 @@ export const timelineView = defineTool({
   async run(ctx, targets, args) {
     if (!targets.length) return 'timeline_view: 対象ノードなし';
     const by = args.by ?? 'created_at';
-    const bucket = args.bucket ?? 'week';
+    let bucket = args.bucket ?? 'week';
+    if (by === 'due' && (bucket === 'hour' || bucket === 'daypart')) bucket = 'day';
     const order = args.order ?? 'asc';
 
     const NONE = '~none';
+    const stampOf = (n: DeskNode) => (by === 'updated' ? (n.metadata?.editedAt as string) || n.created_at : n.created_at);
     const buckets = new Map<string, { label: string; nodes: DeskNode[] }>();
     for (const n of targets) {
-      const day = by === 'due' ? dueOf(n) : toDay(n.created_at);
-      const b = day ? bucketOf(day, bucket) : { key: NONE, label: '期限なし' };
+      let b: { key: string; label: string };
+      if (by === 'due') {
+        const day = dueOf(n);
+        b = day ? bucketOf(day, bucket as 'day' | 'week' | 'month') : { key: NONE, label: '期限なし' };
+      } else if (bucket === 'hour') {
+        const day = toDay(stampOf(n));
+        const h = hourOf(stampOf(n));
+        b = day && h >= 0 ? { key: `${day} ${String(h).padStart(2, '0')}`, label: `${day.slice(5).replace('-', '/')} ${h}時台` } : { key: NONE, label: '日時なし' };
+      } else if (bucket === 'daypart') {
+        const h = hourOf(stampOf(n));
+        const idx = DAYPARTS.findIndex((p) => h >= p.from && h < p.to);
+        b = idx >= 0 ? { key: String(idx), label: `${DAYPARTS[idx].name}（${DAYPARTS[idx].from}〜${DAYPARTS[idx].to}時）` } : { key: NONE, label: '日時なし' };
+      } else {
+        const day = toDay(stampOf(n));
+        b = day ? bucketOf(day, bucket) : { key: NONE, label: '日時なし' };
+      }
       const entry = buckets.get(b.key) ?? { label: b.label, nodes: [] };
       entry.nodes.push(n);
       buckets.set(b.key, entry);
@@ -309,11 +338,14 @@ export const timelineView = defineTool({
     if (order === 'desc') keys.reverse();
     if (buckets.has(NONE)) keys.push(NONE);
 
+    const sortBy = by === 'due' ? 'due' : by === 'updated' ? 'updated' : 'created_at';
     const groups: ViewGroup[] = keys.map((key) => {
       const { label, nodes } = buckets.get(key)!;
-      return { key, label: `${label}（${nodes.length}）`, ids: sortNodes(nodes, by, order).map((n) => n.id) };
+      return { key, label: `${label}（${nodes.length}）`, ids: sortNodes(nodes, sortBy, order).map((n) => n.id) };
     });
 
+    const unit: Record<string, string> = { day: '日', week: '週', month: '月', hour: '時間', daypart: '時間帯' };
+    const what = by === 'due' ? '期限' : by === 'updated' ? '編集日時' : '記入日時';
     return commitView(
       ctx,
       {
@@ -323,7 +355,7 @@ export const timelineView = defineTool({
         groups,
         hiddenIds: hiddenOf(ctx, targets, args.hideOthers),
       },
-      `timeline_view: ${by === 'due' ? '期限' : '作成日'}の${bucket === 'day' ? '日' : bucket === 'week' ? '週' : '月'}単位で${groups.length}区間`
+      `timeline_view: ${what}の${unit[bucket]}単位で${groups.length}区間`
     );
   },
 });

@@ -9,6 +9,24 @@ export function toDay(value: string | Date): string {
   return Number.isNaN(d.getTime()) ? '' : dayFmt.format(d);
 }
 
+const timeFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: DESK_TZ, hour: '2-digit', minute: '2-digit', hour12: false });
+
+/** 日本時間の HH:mm */
+export function toTime(value: string | Date): string {
+  const d = typeof value === 'string' ? new Date(value) : value;
+  return Number.isNaN(d.getTime()) ? '' : timeFmt.format(d);
+}
+/** 日本時間の「2026-11-21 16:55」 */
+export function toDateTime(value: string | Date): string {
+  const d = toDay(value);
+  return d ? `${d} ${toTime(value)}` : '';
+}
+/** 日本時間の時（0〜23）。解釈できなければ -1 */
+export function hourOf(value: string | Date): number {
+  const t = toTime(value);
+  return t ? Number(t.slice(0, 2)) % 24 : -1;
+}
+
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 /** 期限(YYYY-MM-DD)までの日数。今日=0、過ぎていれば負。解釈できなければ NaN */
@@ -43,12 +61,23 @@ export function matchesFilter(n: DeskNode, f: NodeFilter, now: Date): boolean {
   const meta = n.metadata ?? {};
   if (f.stage && meta.stage !== f.stage) return false;
   if (f.pinned != null && !!meta.pinned !== f.pinned) return false;
+  if (f.stacked != null && !!meta.stack !== f.stacked) return false;
   const due = dueOf(n);
   if (f.noDue && due) return false;
   if (f.overdue || f.dueWithinDays != null) {
     const left = due ? daysUntil(due, now) : NaN;
     if (Number.isNaN(left)) return false;
     if (f.overdue ? left >= 0 : left > (f.dueWithinDays as number)) return false;
+  }
+
+  if (f.hourFrom != null || f.hourTo != null) {
+    const h = hourOf(n.created_at);
+    if (h < 0) return false;
+    const from = f.hourFrom ?? 0;
+    const to = f.hourTo ?? 24;
+    // 例：22〜5 のように日をまたぐ指定にも対応
+    const inRange = from <= to ? h >= from && h < to : h >= from || h < to;
+    if (!inRange) return false;
   }
 
   const createdMs = new Date(n.created_at).getTime();
