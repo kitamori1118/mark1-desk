@@ -345,6 +345,68 @@ function trySearch(c: string, ctx: Ctx): Res {
   return plan(`🔎 ${r.matched.length}件が見つかりました`, item('zoom', r.target, { focus: true, dimOthers: true }));
 }
 
+/** リスト化：「タスクをリスト化して」「チェックリストにして」「番号付きで書き出して」（要約・まとめはAIへ） */
+function tryList(c: string, ctx: Ctx): Res {
+  if (!/(リスト化|箇条書き|チェックリスト|リストにして|リストで|書き出して|テキストにして)/.test(c)) return 'skip';
+  if (/(まとめ|要約|要点|ポイント|サマリ|議事録|考えて|分析)/.test(c)) return 'skip'; // 要約は AI（summarize_bullets）
+  const format = /チェックリスト|チェック/.test(c) ? 'checklist' : /(番号|連番|ナンバー)/.test(c) ? 'numbered' : 'bullets';
+  const rest = c.replace(/(リスト化|箇条書き|チェックリスト|リスト|番号付き|連番|書き出し|テキスト)(に|で)?(して|て)?|(して|ください)/g, ' ');
+  const sel = parseSelector(rest, ctx, 'list');
+  const r = sel.has ? resolve(sel, ctx) : resolve({ filter: {}, all: true, has: true }, ctx);
+  if (!r.matched.length) return null;
+  const withs = /(時間|時刻|日時)/.test(c) ? ['due', 'stage', 'time'] : /タグ/.test(c) ? ['due', 'stage', 'tags'] : ['due', 'stage'];
+  const groupBy = /(カテゴリ|部署)(ごと|別)/.test(c) ? 'category' : /(ステージ|進行状況)(ごと|別)/.test(c) ? 'stage' : /タグ(ごと|別)/.test(c) ? 'tag' : undefined;
+  const sortBy = /期限順/.test(c) ? 'due' : 'created_at';
+  const args: Record<string, any> = { format, with: withs, sortBy, title: sel.filter.keyword ? `${sel.filter.keyword}のリスト` : 'リスト' };
+  if (groupBy) args.groupBy = groupBy;
+  return plan(`${r.matched.length}件をリスト化`, item('list_nodes', r.target, args));
+}
+
+/** 題名：「『見積』の題名を『請求対応』にして」「自動で題名をつけて」「題名を外して」（AIに任せたい「題名をつけて」は AI） */
+function tryTitle(c: string, ctx: Ctx): Res {
+  if (!/(題名|タイトル|見出し)/.test(c)) return 'skip';
+  const set = c.match(/[「『]([^」』]+)[」』](?:の)?(?:題名|タイトル|見出し)(?:を)?[「『]([^」』]+)[」』](?:に)?(?:して|変更|する|設定|変えて)/);
+  if (set) {
+    const hit = findOne(ctx, set[1]);
+    return hit ? plan('題名を設定', item('set_title', {}, { assignments: [{ id: hit.id, title: set[2] }] })) : null;
+  }
+  const rest = c.replace(/(自動で?|勝手に)?(題名|タイトル|見出し)(を)?(つけて|付けて|付与して|入れて|生成して|作って|外して|はずして|消して|削除して|なしに|クリア)?(して)?/g, ' ');
+  if (/(外して|はずして|消して|削除|なしに|クリア)/.test(c)) {
+    const sel = parseSelector(rest, ctx, 'title');
+    const r = sel.has ? resolve(sel, ctx) : resolve({ filter: {}, all: true, has: true }, ctx);
+    return r.matched.length ? plan(`${r.matched.length}件の題名を外す`, item('set_title', r.target, { clear: true })) : null;
+  }
+  if (/(自動|勝手に)/.test(c)) {
+    const sel = parseSelector(rest, ctx, 'title');
+    const r = sel.has ? resolve(sel, ctx) : resolve({ filter: {}, all: true, has: true }, ctx);
+    const need = r.matched.filter((n) => !n.metadata?.title);
+    return need.length ? plan(`${need.length}件に自動で題名`, item('set_title', r.target, { auto: true })) : null;
+  }
+  return null; // 「題名をつけて」→ AI が内容から短い題名を書く
+}
+
+/** 個別の大きさ：「タスクを大きくして」「重要なものを小さく」「標準サイズに戻して」 */
+function tryResize(c: string, ctx: Ctx): Res {
+  const bigger = /(大きく|でかく|拡大)/.test(c);
+  const smaller = /(小さく|ちいさく|縮小)/.test(c);
+  const reset = /(標準|普通|元|デフォルト)(の)?(サイズ|大きさ)/.test(c);
+  const num = c.match(/(\d+(?:\.\d+)?)\s*倍/) ?? null;
+  const pct = c.match(/(\d{2,3})\s*[%％](の)?(サイズ|大きさ)/);
+  if (!bigger && !smaller && !reset && !num && !pct) return 'skip';
+  if (QUESTION_RE.test(c) || /(表示|画面|ズーム)/.test(c)) return 'skip';
+
+  const rest = c.replace(/(もっと|少し|ちょっと|さらに)?(大きく|でかく|拡大|小さく|ちいさく|縮小)(して)?|\d+(?:\.\d+)?\s*倍(に)?|\d{2,3}\s*[%％](の)?(サイズ|大きさ)(に)?|(標準|普通|元|デフォルト)(の)?(サイズ|大きさ)(に)?(戻)?(して)?|(サイズ|大きさ)(を)?/g, ' ');
+  const sel = parseSelector(rest, ctx, 'resize');
+  if (!sel.has) return null;
+  const r = resolve(sel, ctx);
+  if (!r.matched.length) return null;
+
+  const strong = /(もっと|さらに)/.test(c);
+  const slight = /(少し|ちょっと)/.test(c);
+  const args: Record<string, any> = reset ? { reset: true } : pct ? { set: Number(pct[1]) / 100 } : num ? { set: Number(num[1]) } : bigger ? { scale: strong ? 1.5 : slight ? 1.15 : 1.3 } : { scale: strong ? 0.6 : slight ? 0.88 : 0.75 };
+  return plan(`${r.matched.length}件の大きさを${reset ? '標準に' : bigger || (num && Number(num[1]) > 1) ? '拡大' : '縮小'}`, item('resize_nodes', r.target, args));
+}
+
 /** 重ねる／ばらす：「〇〇を重ねて」「カテゴリごとに重ねて」「ばらして」 */
 function tryStack(c: string, ctx: Ctx): Res {
   const unstack =
@@ -577,7 +639,7 @@ export function localPlan(raw: string, nodes: DeskNode[], now = new Date()): Exe
   const ctx: Ctx = { nodes, now, knownTags };
 
   // 先に当てはまったハンドラが答えを決める（null = 当てはまったが自信が無い → AI）
-  for (const handler of [tryStack, tryLinks, tryDuplicates, tryReports, tryDue, tryTags, trySearch, tryReset, tryDeadlineView]) {
+  for (const handler of [tryList, tryTitle, tryResize, tryStack, tryLinks, tryDuplicates, tryReports, tryDue, tryTags, trySearch, tryReset, tryDeadlineView]) {
     const r = handler(c, ctx);
     if (r !== 'skip') return r;
   }

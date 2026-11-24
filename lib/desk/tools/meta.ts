@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { defineTool } from '../types';
-import { daysUntil, dueOf } from '../selector';
+import { daysUntil, dueOf, nodeTags, toDateTime } from '../selector';
 import { similarity } from '../similar';
 
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -233,5 +233,136 @@ export const findDuplicates = defineTool({
       );
     }
     return `find_duplicates: ${pairs.length}組・${entries.length}件に重複の可能性`;
+  },
+});
+
+/* ------------------------------------------------------------------ */
+/* resize_nodes：ノードごとの大きさ                                      */
+/* ------------------------------------------------------------------ */
+
+export const resizeNodes = defineTool({
+  name: 'resize_nodes',
+  phase: 53,
+  description: '対象ノードのオーブの大きさを変える（「タスクを大きくして」「重要なものを小さく」「標準サイズに戻して」）。画面全体の拡大縮小ではなく、ノード個別の大きさ',
+  argsHint: '{ scale?: number（今の大きさに掛ける倍率。大きく=1.3 / 小さく=0.75）, set?: number（大きさを直接指定。1=標準、0.5〜2.2）, reset?: boolean（標準に戻す） }',
+  defaultTarget: 'none',
+  argsSchema: z.object({
+    scale: z.number().min(0.2).max(5).nullish(),
+    set: z.number().min(0.3).max(3).nullish(),
+    reset: z.boolean().nullish(),
+  }),
+  async run(ctx, targets, args) {
+    if (!targets.length) return 'resize_nodes: 対象ノードなし';
+    const clamp = (v: number) => Math.min(2.2, Math.max(0.5, Math.round(v * 100) / 100));
+    const work = targets.map((n) => {
+      const cur = typeof n.metadata?.size === 'number' ? (n.metadata.size as number) : 1;
+      const next = args.reset ? 1 : args.set != null ? clamp(args.set) : args.scale != null ? clamp(cur * args.scale) : cur;
+      return { id: n.id, size: Math.abs(next - 1) < 0.01 ? null : next };
+    });
+    for (let i = 0; i < work.length; i += CHUNK) {
+      await Promise.all(work.slice(i, i + CHUNK).map((w) => ctx.patchNodes([w.id], { metadata: { size: w.size } })));
+    }
+    return `resize_nodes: ${work.length}件の大きさを${args.reset ? '標準に戻しました' : '変更'}`;
+  },
+});
+
+/* ------------------------------------------------------------------ */
+/* set_title：題名（見出し）                                             */
+/* ------------------------------------------------------------------ */
+
+/** AIなしの自動題名：最初の文／句の頭を短く切り出す */
+const autoTitle = (content: string): string => {
+  const first = content.replace(/^【[^】]*】[:：]?\s*/, '').split(/[\n。！？!?]/)[0].split(/[：:、,]/)[0].trim();
+  const t = first || content.trim();
+  return t.length > 14 ? `${t.slice(0, 13)}…` : t;
+};
+
+export const setTitle = defineTool({
+  name: 'set_title',
+  phase: 33,
+  description:
+    'ノードに題名（短い見出し）を付ける・変える・外す。「題名をつけて」はAIが内容を読んで短い題名を書く（assignments）。「自動で題名」は先頭の文を切り出す（auto。AIなし）',
+  argsHint:
+    '{ assignments?: [{ id, title }]（AIが内容から付ける題名。12字以内・名詞句）, title?: string（targetの全ノードに同じ題名）, auto?: boolean（本文の先頭から自動で。題名の無いノードだけ）, clear?: boolean（題名を外す） }',
+  defaultTarget: 'none',
+  argsSchema: z.object({
+    assignments: z.array(z.object({ id: z.string(), title: z.string().min(1) })).max(80).nullish(),
+    title: z.string().nullish(),
+    auto: z.boolean().nullish(),
+    clear: z.boolean().nullish(),
+  }),
+  async run(ctx, targets, args) {
+    const work = new Map<string, string | null>();
+    if (args.clear) targets.forEach((n) => work.set(n.id, null));
+    else if (args.title?.trim()) targets.forEach((n) => work.set(n.id, args.title!.trim().slice(0, 30)));
+    else if (args.auto) targets.filter((n) => !n.metadata?.title).forEach((n) => work.set(n.id, autoTitle(n.content)));
+    for (const a of args.assignments ?? []) {
+      const id = ctx.realId(a.id);
+      if (id) work.set(id, a.title.trim().slice(0, 30));
+    }
+    if (!work.size) return 'set_title: 題名を付ける対象なし';
+    const entries = [...work.entries()];
+    for (let i = 0; i < entries.length; i += CHUNK) {
+      await Promise.all(entries.slice(i, i + CHUNK).map(([id, t]) => ctx.patchNodes([id], { metadata: { title: t } })));
+    }
+    return `set_title: ${work.size}件の題名を${args.clear ? '外しました' : '更新'}`;
+  },
+});
+
+/* ------------------------------------------------------------------ */
+/* list_nodes：リスト化（箇条書き・番号・チェックリストのテキストを作る。AIなし） */
+/* ------------------------------------------------------------------ */
+
+export const listNodes = defineTool({
+  name: 'list_nodes',
+  phase: 94,
+  replayable: true,
+  description:
+    '対象ノードを、コピーして使える文章のリスト（箇条書き・番号付き・チェックリスト）にして回答パネルに出す。「リスト化して」「箇条書きにして」「チェックリストにして」。要約はしない（要約は summarize_bullets）',
+  argsHint:
+    "{ format?: 'bullets'|'numbered'|'checklist'（既定bullets）, with?: ('due'|'stage'|'time'|'tags')[]（各行に添える情報。既定 due, stage）, groupBy?: 'category'|'stage'|'tag'（見出しでグループ化）, sortBy?: 'created_at'|'due'（既定created_at）, title?: string }",
+  defaultTarget: 'all',
+  argsSchema: z.object({
+    format: z.enum(['bullets', 'numbered', 'checklist']).nullish(),
+    with: z.array(z.enum(['due', 'stage', 'time', 'tags'])).nullish(),
+    groupBy: z.enum(['category', 'stage', 'tag']).nullish(),
+    sortBy: z.enum(['created_at', 'due']).nullish(),
+    title: z.string().nullish(),
+  }),
+  async run(ctx, targets, args) {
+    if (!targets.length) return 'list_nodes: 対象ノードなし';
+    const format = args.format ?? 'bullets';
+    const withs = new Set(args.with ?? ['due', 'stage']);
+    const sorted = [...targets].sort((a, b) =>
+      args.sortBy === 'due'
+        ? (dueOf(a) || '9999').localeCompare(dueOf(b) || '9999')
+        : String(a.created_at).localeCompare(String(b.created_at))
+    );
+    const line = (n: (typeof sorted)[number], i: number) => {
+      const head = format === 'numbered' ? `${i + 1}.` : format === 'checklist' ? (n.metadata?.stage === '完了' ? '☑' : '☐') : '・';
+      const text = (n.metadata?.title as string) || n.content.replace(/\s+/g, ' ').trim();
+      const extra: string[] = [];
+      if (withs.has('due') && dueOf(n)) extra.push(`期限 ${dueOf(n).slice(5).replace('-', '/')}`);
+      if (withs.has('stage') && n.metadata?.stage) extra.push(String(n.metadata.stage));
+      if (withs.has('time')) extra.push(toDateTime(n.created_at).slice(5).replace('-', '/'));
+      if (withs.has('tags')) extra.push(nodeTags(n).map((t) => `@${t}`).join(' '));
+      return `${head} ${text}${extra.length ? `（${extra.join('・')}）` : ''}`;
+    };
+    const out: string[] = [`■ ${args.title ?? 'リスト'}（${sorted.length}件）`];
+    if (args.groupBy) {
+      const groups = new Map<string, typeof sorted>();
+      for (const n of sorted) {
+        const k = args.groupBy === 'category' ? n.category : args.groupBy === 'stage' ? (n.metadata?.stage as string) || '(未設定)' : nodeTags(n)[0] ?? '(タグなし)';
+        groups.set(k, [...(groups.get(k) ?? []), n]);
+      }
+      for (const [k, list] of groups) {
+        out.push('', `▼ ${k}`);
+        list.forEach((n, i) => out.push(line(n, i)));
+      }
+    } else {
+      sorted.forEach((n, i) => out.push(line(n, i)));
+    }
+    ctx.reports.push(out.join('\n'));
+    return `list_nodes: ${sorted.length}件をリスト化`;
   },
 });

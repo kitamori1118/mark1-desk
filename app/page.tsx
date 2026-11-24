@@ -7,6 +7,7 @@ import { useRouter } from 'next/navigation';
 import type { DeskNode, ViewDirective, ViewLayout } from '@/lib/desk/types';
 import NodeSheet, { type SheetPatch } from '@/lib/desk/ui/NodeSheet';
 import { overviewSuggestions, suggestionsForNewNode, type Suggestion } from '@/lib/desk/insights';
+import { parseViewCommand, type ViewAction } from '@/lib/desk/viewCommands';
 import { computeViewPositions } from '@/lib/desk/layoutPositions';
 import { daysUntil, toDateTime } from '@/lib/desk/selector';
 
@@ -27,6 +28,8 @@ interface StarkNode {
     archived?: boolean;
     links?: string[]; // 線でつないだ相手
     stack?: string; // 重ねている山のID（同じIDは一緒に動く）
+    title?: string; // 題名（短い見出し）
+    size?: number; // このオーブだけの大きさ倍率（1=標準）
     editedAt?: string; // 本文を編集した日時
     sources?: string[]; // コア・AI生成ノードの元ノード
     ai?: boolean;
@@ -80,6 +83,9 @@ const freeOrbSize = () => (typeof window !== 'undefined' && window.innerWidth >=
 
 const WHISPER_KEY = 'mark1desk.whisper';
 const TIME_KEY = 'mark1desk.showTime';
+const ZOOM_KEY = 'mark1desk.zoom';
+const ORB_KEY = 'mark1desk.orbScale';
+const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 const POS_KEY = 'mark1desk.positions.v1'; // 自由配置の位置を端末ごとに保存（リロードしても崩れない）
 /** サーバー側の上限（60秒）より少し長く待ち、それでも返らなければ画面側で打ち切る */
 const CLIENT_TIMEOUT_MS = 70_000;
@@ -114,6 +120,13 @@ export default function Mark1DeskPage() {
   const dragGroup = useRef<{ ids: string[]; base: Record<string, Pos>; start: { x: number; y: number } } | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set()); // Shift+クリック／選択モードで選んだオーブ
   const [selectMode, setSelectMode] = useState(false);
+  // 📷 画面（カメラ）：拡大率・オーブ全体の大きさ・表示領域のサイズ
+  const [zoom, setZoom] = useState(1);
+  const zoomRef = useRef(1);
+  const [orbScale, setOrbScale] = useState(1);
+  const [vp, setVp] = useState({ w: 0, h: 0 });
+  const panRef = useRef<{ x: number; y: number } | null>(null);
+  const pinchRef = useRef<{ dist: number; zoom: number } | null>(null);
   const [showTime, setShowTime] = useState(true); // 記入した時刻をオーブに表示
   const [nodePositions, setNodePositions] = useState<Record<string, Pos>>({});
 
@@ -158,6 +171,13 @@ export default function Mark1DeskPage() {
     try {
       if (localStorage.getItem(WHISPER_KEY) === '0') setWhisperOn(false);
       if (localStorage.getItem(TIME_KEY) === '0') setShowTime(false);
+      const z = Number(localStorage.getItem(ZOOM_KEY));
+      if (z >= 0.15 && z <= 2.5) {
+        setZoom(z);
+        zoomRef.current = z;
+      }
+      const o = Number(localStorage.getItem(ORB_KEY));
+      if (o >= 0.5 && o <= 1.8) setOrbScale(o);
     } catch {
       /* 保存できない環境では既定のOFFのまま */
     }
@@ -180,6 +200,35 @@ export default function Mark1DeskPage() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
+  useEffect(() => {
+    zoomRef.current = zoom;
+  }, [zoom]);
+
+  useEffect(() => {
+    if (!authed) return;
+    const update = () => {
+      const m = mainRef.current;
+      if (m) setVp({ w: m.clientWidth, h: m.clientHeight });
+    };
+    update();
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
+  }, [authed]);
+
+  // PC：Ctrl（⌘）+ホイールで拡大縮小（ブラウザ全体のズームではなく、この画面だけ）
+  useEffect(() => {
+    if (!authed) return;
+    const el = mainRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      zoomTo(zoomRef.current * (e.deltaY < 0 ? 1.1 : 1 / 1.1));
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, [authed]);
+
   const toggleWhisper = () => {
     setWhisperOn((v) => {
       try {
@@ -197,7 +246,11 @@ export default function Mark1DeskPage() {
     setVoiceOk(!!(w.SpeechRecognition || w.webkitSpeechRecognition));
   }, []);
 
-  const orb = view ? VIEW_ORB : isDesktop ? 192 : 176;
+  const baseOrb = Math.round((isDesktop ? 192 : 176) * orbScale);
+  const viewOrb = Math.round(VIEW_ORB * orbScale);
+  const orb = view ? viewOrb : baseOrb;
+  /** オーブ個別の大きさ（整列表示中は、重なり防止のため全員同じ大きさにする） */
+  const orbOf = (n: StarkNode) => (view ? orb : Math.round(orb * clamp(n.metadata?.size ?? 1, 0.5, 2.2)));
   const compact = !!view;
   const hiddenSet = useMemo(() => new Set(view?.hiddenIds ?? []), [view]);
   const archivedCount = useMemo(() => nodes.filter((n) => n.metadata?.archived).length, [nodes]);
@@ -228,6 +281,26 @@ export default function Mark1DeskPage() {
   );
   const dismiss = (id: string) => setDismissed((prev) => new Set(prev).add(id));
 
+  const sizeById = useMemo(() => new Map(visibleNodes.map((n) => [n.id, orbOf(n)] as const)), [visibleNodes, view, orb]);
+
+  /** オーブを置く「ワールド」の大きさ。画面より小さくならず、オーブ全体＋余白を含む */
+  const world = useMemo(() => {
+    let w = vp.w / zoom;
+    let h = vp.h / zoom;
+    visibleNodes.forEach((n) => {
+      const p = nodePositions[n.id];
+      if (!p) return;
+      const sz = sizeById.get(n.id) ?? orb;
+      w = Math.max(w, p.x + sz + 140);
+      h = Math.max(h, p.y + sz + 240);
+    });
+    if (viewLayout) {
+      w = Math.max(w, viewLayout.size.width);
+      h = Math.max(h, viewLayout.size.height + 200);
+    }
+    return { w: Math.ceil(w), h: Math.ceil(h) };
+  }, [vp, zoom, visibleNodes, nodePositions, sizeById, viewLayout, orb]);
+
   // 💡 線：link_nodes の線（実線）と、コア・AI生成ノードの元ノードへの線（点線）
   const edges = useMemo(() => {
     const ids = new Set(visibleNodes.map((n) => n.id));
@@ -250,7 +323,7 @@ export default function Mark1DeskPage() {
   // 💡 整列ロジック（確実に円形・放射状に再配置する）
   const relayoutNodes = (nodeList: StarkNode[]) => {
     const nextPos: Record<string, Pos> = {};
-    const half = freeOrbSize() / 2;
+    const half = Math.round(freeOrbSize() * orbScale) / 2;
     const centerX = (typeof window !== 'undefined' ? window.innerWidth : 800) / 2 - half;
     const centerY = (typeof window !== 'undefined' ? window.innerHeight : 600) / 2 - half;
     const radius = Math.min(centerX, centerY) * 0.55;
@@ -286,12 +359,14 @@ export default function Mark1DeskPage() {
   /** AIの整列指令を画面に反映する（座標計算は lib/desk/layoutPositions.ts） */
   const applyView = (v: ViewDirective) => {
     const width = mainRef.current?.clientWidth ?? (typeof window !== 'undefined' ? window.innerWidth : 390);
-    const layout = computeViewPositions(v, { width, orb: VIEW_ORB, gap: VIEW_GAP });
+    zoomRef.current = 1;
+    setZoom(1);
+    const layout = computeViewPositions(v, { width, orb: viewOrb, gap: VIEW_GAP });
     if (!layout) {
       clearView(true);
       return;
     }
-    const half = VIEW_ORB / 2;
+    const half = viewOrb / 2;
     setNodePositions((prev) => {
       if (!savedFree.current) savedFree.current = prev; // 最初の整列のときだけ元の配置を保存
       const next = { ...prev };
@@ -513,6 +588,13 @@ export default function Mark1DeskPage() {
 
   const runCommand = async (text: string, fromInput = false) => {
     if (!text.trim()) return;
+    // 画面の見え方に関する指令は、サーバーに送らず、その場で実行する（即時・無料）
+    const va = parseViewCommand(text);
+    if (va) {
+      applyViewAction(va);
+      if (fromInput) setCommand('');
+      return;
+    }
     await withLoading(`「${text}」を実行中`, async () => {
       const data = await post({ command: text });
       await handleResponse(data, { command: text, fromInput });
@@ -533,6 +615,35 @@ export default function Mark1DeskPage() {
     withLoading(`マクロ「${m.name}」を実行中`, async () => {
       await handleResponse(await post({ action: 'run_macro', id: m.id }));
     });
+
+  const copyReport = async () => {
+    if (!report) return;
+    try {
+      await navigator.clipboard.writeText(report);
+      setSystemLog('📋 コピーしました');
+    } catch {
+      setSystemLog('ERROR: コピーできませんでした（ブラウザの許可を確認）');
+    }
+  };
+
+  /** 回答パネルの内容を、そのままノードとして残す（題名は先頭行） */
+  const reportToNode = async () => {
+    if (!report) return;
+    const first = report.split('\n')[0].replace(/^■\s*/, '').slice(0, 24);
+    const { error } = await supabase.from('stark_nodes').insert({
+      content: report.replace(/^■\s*/, ''),
+      category: 'まとめ',
+      color: 'violet',
+      status: 'normal',
+      metadata: { tags: ['まとめ'], title: first },
+    });
+    if (error) setSystemLog(`ERROR: ${error.message}`);
+    else {
+      setReport(null);
+      await fetchNodes();
+      setSystemLog('📝 ノードとして保存しました');
+    }
+  };
 
   const cancelRunning = () => {
     cancelledRef.current = true;
@@ -688,7 +799,7 @@ export default function Mark1DeskPage() {
     updateNode(
       id,
       { content: p.content, color: p.color, category: p.category },
-      { tags: p.tags, due: p.due, stage: p.stage, pinned: p.pinned },
+      { tags: p.tags, due: p.due, stage: p.stage, pinned: p.pinned, title: p.title },
       'ORB UPDATED.'
     );
 
@@ -730,17 +841,18 @@ export default function Mark1DeskPage() {
   const moveDrag = (clientX: number, clientY: number) => {
     const g = dragGroup.current;
     if (!draggingId || !g) return;
-    const dx = clientX - g.start.x;
-    const dy = clientY - g.start.y;
+    const dx = (clientX - g.start.x) / zoomRef.current;
+    const dy = (clientY - g.start.y) / zoomRef.current;
     setNodePositions((prev) => {
       const next = { ...prev };
-      g.ids.forEach((i) => (next[i] = { x: g.base[i].x + dx, y: g.base[i].y + dy }));
+      g.ids.forEach((i) => (next[i] = { x: Math.max(0, g.base[i].x + dx), y: Math.max(0, g.base[i].y + dy) }));
       return next;
     });
   };
 
   // ほぼ動かさずに離した＝タップ → 編集シート（選択モード中は選択のON/OFF）
   const endDrag = () => {
+    panRef.current = null;
     const st = dragStart.current;
     dragStart.current = null;
     dragGroup.current = null;
@@ -757,10 +869,137 @@ export default function Mark1DeskPage() {
 
   const clearSelection = () => setSelected(new Set());
 
+  /* ---------------- 📷 カメラ（拡大・縮小・移動・収める・リセット） ---------------- */
+
+  const persist = (key: string, v: number) => {
+    try {
+      localStorage.setItem(key, String(v));
+    } catch {
+      /* noop */
+    }
+  };
+
+  /** 画面の中心を保ったまま拡大率を変える */
+  const zoomTo = (target: number) => {
+    const el = mainRef.current;
+    const z0 = zoomRef.current;
+    const z1 = clamp(target, 0.15, 2.5);
+    zoomRef.current = z1;
+    setZoom(z1);
+    persist(ZOOM_KEY, z1);
+    if (!el) return z1;
+    const cx = (el.scrollLeft + el.clientWidth / 2) / z0;
+    const cy = (el.scrollTop + el.clientHeight / 2) / z0;
+    setTimeout(() => {
+      el.scrollLeft = cx * z1 - el.clientWidth / 2;
+      el.scrollTop = cy * z1 - el.clientHeight / 2;
+    }, 40);
+    return z1;
+  };
+
+  /** 見えているオーブ全体を囲む範囲（ワールド座標） */
+  const contentBox = () => {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    visibleNodes.forEach((n) => {
+      if ((hiddenSet.has(n.id) && !n.metadata?.archived) || (tagFilter && !nodeTagsOf(n).includes(tagFilter))) return;
+      const p = nodePositions[n.id];
+      if (!p) return;
+      const sz = orbOf(n);
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x + sz);
+      maxY = Math.max(maxY, p.y + sz);
+    });
+    return Number.isFinite(minX) ? { minX, minY, maxX, maxY } : null;
+  };
+
+  const fitAll = () => {
+    const el = mainRef.current;
+    const box = contentBox();
+    if (!el || !box) return null;
+    const pad = 30;
+    const bw = box.maxX - box.minX;
+    const bh = box.maxY - box.minY;
+    const z = clamp(Math.min((el.clientWidth - pad * 2) / bw, (el.clientHeight - pad * 2) / bh), 0.15, 1.5);
+    zoomRef.current = z;
+    setZoom(z);
+    persist(ZOOM_KEY, z);
+    setTimeout(() => {
+      el.scrollTo({
+        left: Math.max(0, box.minX * z - pad - (el.clientWidth - pad * 2 - bw * z) / 2),
+        top: Math.max(0, box.minY * z - pad - (el.clientHeight - pad * 2 - bh * z) / 2),
+        behavior: 'smooth',
+      });
+    }, 60);
+    return z;
+  };
+
+  const resetCamera = (alsoClearView: boolean) => {
+    zoomRef.current = 1;
+    setZoom(1);
+    persist(ZOOM_KEY, 1);
+    if (alsoClearView && view) clearView(true);
+    setTimeout(() => mainRef.current?.scrollTo({ left: 0, top: 0, behavior: 'smooth' }), 40);
+  };
+
+  const gotoWhere = (where: 'top' | 'bottom' | 'left' | 'right' | 'center' | 'origin') => {
+    const el = mainRef.current;
+    if (!el) return;
+    if (where === 'top') el.scrollTo({ top: 0, behavior: 'smooth' });
+    else if (where === 'bottom') el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    else if (where === 'left') el.scrollTo({ left: 0, behavior: 'smooth' });
+    else if (where === 'right') el.scrollTo({ left: el.scrollWidth, behavior: 'smooth' });
+    else if (where === 'origin') el.scrollTo({ left: 0, top: 0, behavior: 'smooth' });
+    else {
+      const box = contentBox();
+      const z = zoomRef.current;
+      if (box) el.scrollTo({ left: ((box.minX + box.maxX) / 2) * z - el.clientWidth / 2, top: ((box.minY + box.maxY) / 2) * z - el.clientHeight / 2, behavior: 'smooth' });
+    }
+  };
+
+  const setOrbSizeScale = (v: number) => {
+    const next = clamp(v, 0.5, 1.8);
+    setOrbScale(next);
+    persist(ORB_KEY, next);
+    return next;
+  };
+
+  /** 端末側だけで解釈した画面操作を実行する（サーバーへ送らない） */
+  const applyViewAction = (a: ViewAction) => {
+    if (a.type === 'zoom') {
+      if (a.mode === 'in' || a.mode === 'out') setSystemLog(`🔍 ${Math.round(zoomTo(zoomRef.current * a.factor) * 100)}%`);
+      else if (a.mode === 'set') setSystemLog(`🔍 ${Math.round(zoomTo(a.value) * 100)}%`);
+      else if (a.mode === 'fit') {
+        const z = fitAll();
+        setSystemLog(z ? `🔍 画面に収めました（${Math.round(z * 100)}%）` : '収めるオーブがありません');
+      } else if (a.mode === 'reset') {
+        resetCamera(a.clearView);
+        setSystemLog(a.clearView ? '🔍 表示をリセットしました（100%・自由配置）' : '🔍 100% に戻しました');
+      }
+    } else if (a.type === 'pan') {
+      const el = mainRef.current;
+      if (el) {
+        const dx = a.dir === 'left' ? -1 : a.dir === 'right' ? 1 : 0;
+        const dy = a.dir === 'up' ? -1 : a.dir === 'down' ? 1 : 0;
+        el.scrollBy({ left: dx * a.pages * el.clientWidth, top: dy * a.pages * el.clientHeight, behavior: 'smooth' });
+      }
+      setSystemLog(`➡ ${({ up: '上', down: '下', left: '左', right: '右' } as const)[a.dir]}へ移動`);
+    } else if (a.type === 'goto') {
+      gotoWhere(a.where);
+      setSystemLog('➡ 移動しました');
+    } else {
+      const next = a.mode === 'up' ? orbScale * 1.2 : a.mode === 'down' ? orbScale / 1.2 : a.mode === 'reset' ? 1 : a.value ?? 1;
+      setSystemLog(`⬚ オーブの大きさ ${Math.round(setOrbSizeScale(next) * 100)}%`);
+    }
+  };
+
   /** 重ねる：位置を1か所に寄せて、少しずつずらして積む。groups が複数なら、山を並べて置く */
   const applyStack = (groups: { id: string; ids: string[] }[]) => {
-    const width = mainRef.current?.clientWidth ?? 390;
-    const o = isDesktop ? 192 : 176;
+    const width = (mainRef.current?.clientWidth ?? 390) / zoomRef.current;
+    const o = baseOrb;
     setNodePositions((prev) => {
       const next = { ...prev };
       groups.forEach((g, gi) => {
@@ -896,7 +1135,15 @@ export default function Mark1DeskPage() {
   return (
     <div
       className="min-h-screen bg-[#030712] text-[#00f0ff] font-mono overflow-hidden relative select-none flex flex-col justify-between"
-      onMouseMove={(e) => moveDrag(e.clientX, e.clientY)}
+      onMouseMove={(e) => {
+        const pan = panRef.current;
+        if (pan && mainRef.current) {
+          mainRef.current.scrollLeft -= e.clientX - pan.x;
+          mainRef.current.scrollTop -= e.clientY - pan.y;
+          panRef.current = { x: e.clientX, y: e.clientY };
+        }
+        moveDrag(e.clientX, e.clientY);
+      }}
       onMouseUp={endDrag}
       onTouchMove={(e) => {
         if (e.touches[0]) moveDrag(e.touches[0].clientX, e.touches[0].clientY);
@@ -905,30 +1152,6 @@ export default function Mark1DeskPage() {
     >
       <div className="absolute inset-0 bg-[linear-gradient(to_right,#00f0ff05_1px,transparent_1px),linear-gradient(to_bottom,#00f0ff05_1px,transparent_1px)] bg-[size:40px_40px] pointer-events-none" />
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,transparent_20%,#030712_95%)] pointer-events-none" />
-
-      {/* 💡 線：「つないで」で作った線（実線）と、コア・AI生成ノードの元ノードへの線（点線）だけ描く。指令が無いときは線なし */}
-      {!view && edges.length > 0 && (
-        <svg className="absolute inset-0 w-full h-full pointer-events-none z-0">
-          {edges.map((e) => {
-            const p1 = nodePositions[e.a];
-            const p2 = nodePositions[e.b];
-            if (!p1 || !p2) return null;
-            return (
-              <line
-                key={`edge-${e.a}-${e.b}`}
-                x1={p1.x + half}
-                y1={p1.y + half}
-                x2={p2.x + half}
-                y2={p2.y + half}
-                stroke={e.kind === 'link' ? '#00f0ff' : '#fbbf24'}
-                strokeWidth={e.kind === 'link' ? 1.5 : 1}
-                strokeOpacity={e.kind === 'link' ? 0.55 : 0.4}
-                strokeDasharray={e.kind === 'link' ? undefined : '4 4'}
-              />
-            );
-          })}
-        </svg>
-      )}
 
       <header className="relative z-30 flex justify-between items-center gap-2 px-4 py-3 bg-[#030712]/80 backdrop-blur-md border-b border-[#00f0ff33]">
         <div className="min-w-0">
@@ -1055,21 +1278,67 @@ export default function Mark1DeskPage() {
       {/* メイン オーブ空間 */}
       <main
         ref={mainRef}
-        className="relative z-10 flex-1 w-full h-[calc(100vh-205px)] overflow-auto"
+        data-bg="1"
+        className="relative z-10 flex-1 w-full h-[calc(100vh-205px)] overflow-auto cursor-grab active:cursor-grabbing"
+        style={{ touchAction: 'pan-x pan-y' }}
         onMouseDown={(e) => {
-          if (e.target === e.currentTarget) clearSelection();
+          // 空いている場所をつかんで動かすと、表示が動く（PC）。クリックだけなら選択解除
+          if ((e.target as HTMLElement).dataset?.bg) {
+            clearSelection();
+            panRef.current = { x: e.clientX, y: e.clientY };
+          }
         }}
         onTouchStart={(e) => {
-          if (e.target === e.currentTarget) clearSelection();
+          if (e.touches.length === 2) {
+            // 2本指：拡大縮小（ピンチ）。オーブのドラッグは中止
+            dragGroup.current = null;
+            setDraggingId(null);
+            setDragIds([]);
+            const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+            pinchRef.current = { dist: d, zoom: zoomRef.current };
+          } else if ((e.target as HTMLElement).dataset?.bg) clearSelection();
+        }}
+        onTouchMove={(e) => {
+          if (pinchRef.current && e.touches.length === 2) {
+            const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+            zoomTo(pinchRef.current.zoom * (d / pinchRef.current.dist));
+          }
+        }}
+        onTouchEnd={() => {
+          pinchRef.current = null;
         }}
       >
-        {/* 整列表示のとき、スクロール範囲を確保する（下部の固定フッター分も加算） */}
-        {viewLayout && (
-          <div
-            className="absolute top-0 left-0 pointer-events-none"
-            style={{ width: viewLayout.size.width, height: viewLayout.size.height + 180 }}
-          />
-        )}
+        {/* ワールド：オーブ・線・見出しはこの中に置き、拡大率に合わせて一緒に拡大縮小する */}
+        <div
+          data-bg="1"
+          className="absolute top-0 left-0"
+          style={{ width: world.w, height: world.h, transform: `scale(${zoom})`, transformOrigin: '0 0' }}
+        >
+          {/* 線：「つないで」で作った線（実線）と、コア・AI生成ノードの元ノードへの線（点線）だけ描く */}
+          {!view && edges.length > 0 && (
+            <svg className="absolute top-0 left-0 pointer-events-none z-0" width={world.w} height={world.h}>
+              {edges.map((e) => {
+                const p1 = nodePositions[e.a];
+                const p2 = nodePositions[e.b];
+                if (!p1 || !p2) return null;
+                const h1 = (sizeById.get(e.a) ?? orb) / 2;
+                const h2 = (sizeById.get(e.b) ?? orb) / 2;
+                return (
+                  <line
+                    key={`edge-${e.a}-${e.b}`}
+                    x1={p1.x + h1}
+                    y1={p1.y + h1}
+                    x2={p2.x + h2}
+                    y2={p2.y + h2}
+                    stroke={e.kind === 'link' ? '#00f0ff' : '#fbbf24'}
+                    strokeWidth={e.kind === 'link' ? 1.5 : 1}
+                    strokeOpacity={e.kind === 'link' ? 0.55 : 0.4}
+                    strokeDasharray={e.kind === 'link' ? undefined : '4 4'}
+                  />
+                );
+              })}
+            </svg>
+          )}
 
         {/* セクション見出し（グループ・時系列・カンバン・マトリクス） */}
         {viewLayout?.labels.map((l) => (
@@ -1117,6 +1386,9 @@ export default function Mark1DeskPage() {
           const inDrag = dragIds.includes(node.id);
           const stackZ = inDrag ? 60 + (stackIds ? stackIds.length - stackIdx : 0) : stackIds ? 10 + (stackIds.length - stackIdx) : undefined;
           const isSelected = selected.has(node.id);
+          const nodeOrb = sizeById.get(node.id) ?? orb;
+          const small = nodeOrb < 120;
+          const title = node.metadata?.title;
           const isDone = node.metadata?.stage === '完了';
 
           return (
@@ -1127,8 +1399,9 @@ export default function Mark1DeskPage() {
                 if (e.touches[0]) startDrag(node.id, e.touches[0].clientX, e.touches[0].clientY);
               }}
               style={{
-                width: orb,
-                height: orb,
+                width: nodeOrb,
+                height: nodeOrb,
+                touchAction: 'none',
                 transform: `translate(${pos.x}px, ${pos.y}px)`,
                 opacity: isHidden ? 0 : opacity,
                 pointerEvents: isHidden ? 'none' : undefined,
@@ -1194,8 +1467,12 @@ export default function Mark1DeskPage() {
                 </button>
               )}
 
+              {title && (
+                <div className={`font-bold text-white leading-tight mb-0.5 px-1 line-clamp-1 ${small ? 'text-[10px]' : 'text-[12px]'}`}>{title}</div>
+              )}
+
               {/* タグ表示 */}
-              <div className="flex flex-wrap justify-center gap-1 mb-1 max-w-full overflow-hidden max-h-[38px]">
+              <div className={`flex flex-wrap justify-center gap-1 mb-1 max-w-full overflow-hidden max-h-[38px] ${small ? 'hidden' : ''}`}>
                 {tags.map((t, idx) => (
                   <span key={idx} className="text-[8px] px-1.5 py-0.5 rounded-full bg-black/60 border border-current tracking-wider font-bold">
                     @{t}
@@ -1206,14 +1483,14 @@ export default function Mark1DeskPage() {
               {/* 本文（角丸の四角なので、まん丸のときより行数を多く出せる） */}
               <p
                 className={`text-[11px] md:text-xs tracking-wide text-slate-100 leading-tight px-1 ${
-                  compact ? 'line-clamp-3' : 'line-clamp-4'
+                  small || title ? 'line-clamp-2' : compact ? 'line-clamp-3' : 'line-clamp-4'
                 }`}
               >
                 {node.content}
               </p>
 
               {/* 期限・ステージ・AI生成の印 */}
-              {(due || node.metadata?.stage || node.metadata?.ai) && (
+              {!small && (due || node.metadata?.stage || node.metadata?.ai) && (
                 <div className="mt-1 flex flex-wrap justify-center gap-1 text-[8px]">
                   {node.metadata?.ai && <span className="px-1 rounded border border-current text-fuchsia-300">AI</span>}
                   {node.metadata?.stage && (
@@ -1223,7 +1500,7 @@ export default function Mark1DeskPage() {
                 </div>
               )}
 
-              {showTime && (
+              {showTime && !small && (
                 <div className="mt-0.5 text-[8px] text-slate-500 tracking-wide">🕒 {toDateTime(node.created_at).slice(5).replace('-', '/')}</div>
               )}
 
@@ -1247,6 +1524,7 @@ export default function Mark1DeskPage() {
             </div>
           );
         })}
+        </div>
       </main>
 
       {selectedNode && (
@@ -1260,15 +1538,46 @@ export default function Mark1DeskPage() {
         />
       )}
 
+      {/* 📷 画面操作（指令でもできます：「拡大」「縮小」「画面に収めて」「表示をリセット」） */}
+      <div className="fixed right-3 top-28 z-30 flex flex-col items-center gap-1.5">
+        {(
+          [
+            ['＋', '拡大', { type: 'zoom', mode: 'in', factor: 1.25 }],
+            ['−', '縮小', { type: 'zoom', mode: 'out', factor: 1 / 1.25 }],
+            ['⤢', '画面に収める', { type: 'zoom', mode: 'fit' }],
+            ['⟲', '表示をリセット', { type: 'zoom', mode: 'reset', clearView: true }],
+          ] as [string, string, ViewAction][]
+        ).map(([label, title, action]) => (
+          <button
+            key={title}
+            type="button"
+            onClick={() => applyViewAction(action)}
+            title={title}
+            className="w-8 h-8 rounded-full border border-[#00f0ff]/40 bg-[#0a1128]/90 text-[#00f0ff] text-sm hover:bg-[#00f0ff]/20 active:scale-95 transition-all"
+          >
+            {label}
+          </button>
+        ))}
+        <div className="text-[9px] text-slate-400">{Math.round(zoom * 100)}%</div>
+      </div>
+
       {/* AIからの回答パネル（report ツール） */}
       {report && (
         <div className="fixed bottom-44 left-3 right-3 z-40 max-w-2xl mx-auto">
           <div className="bg-[#0a1128]/95 backdrop-blur-2xl border border-fuchsia-400/70 rounded-2xl p-4 shadow-[0_0_30px_rgba(217,70,239,0.25)]">
             <div className="flex justify-between items-center mb-2">
               <span className="text-xs font-bold text-fuchsia-300 tracking-widest">🧠 JARVIS REPORT</span>
-              <button type="button" onClick={() => setReport(null)} className="text-slate-400 hover:text-white text-xs px-2 py-0.5">
-                [ 閉じる ✕ ]
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button type="button" onClick={copyReport} className="text-[10px] border border-fuchsia-300/60 text-fuchsia-200 px-2 py-0.5 rounded-full hover:bg-fuchsia-400/20">
+                  📋 コピー
+                </button>
+                <button type="button" onClick={reportToNode} className="text-[10px] border border-fuchsia-300/60 text-fuchsia-200 px-2 py-0.5 rounded-full hover:bg-fuchsia-400/20">
+                  📝 ノードにする
+                </button>
+                <button type="button" onClick={() => setReport(null)} className="text-slate-400 hover:text-white text-xs px-2 py-0.5">
+                  [ 閉じる ✕ ]
+                </button>
+              </div>
             </div>
             <div className="max-h-[40vh] overflow-y-auto text-xs md:text-sm text-slate-100 whitespace-pre-wrap leading-relaxed select-text">
               {report}

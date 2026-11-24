@@ -10,7 +10,7 @@ export interface SheetNode {
   content: string;
   category: string;
   color: string;
-  metadata?: { tags?: string[]; due?: string; stage?: string; pinned?: boolean; archived?: boolean; editedAt?: string };
+  metadata?: { tags?: string[]; due?: string; stage?: string; pinned?: boolean; archived?: boolean; editedAt?: string; title?: string };
 }
 
 export interface SheetPatch {
@@ -21,6 +21,7 @@ export interface SheetPatch {
   due: string | null;
   stage: string | null;
   pinned: boolean;
+  title: string | null;
 }
 
 const COLORS: [string, string][] = [
@@ -66,6 +67,7 @@ export default function NodeSheet({
   onDelete: () => Promise<void>;
 }) {
   const m = node.metadata ?? {};
+  const [title, setTitle] = useState(m.title ?? '');
   const [content, setContent] = useState(node.content);
   const [tags, setTags] = useState((m.tags && m.tags.length ? m.tags : [node.category]).map((t) => `@${t}`).join(' '));
   const [due, setDue] = useState(m.due ?? '');
@@ -85,6 +87,7 @@ export default function NodeSheet({
       due: due || null,
       stage: stage || null,
       pinned,
+      title: title.trim() || null,
     });
     setBusy(false);
   };
@@ -103,6 +106,7 @@ export default function NodeSheet({
           </button>
         </div>
 
+        <input type="text" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="題名（任意・短い見出し）" className={`${field} font-bold`} />
         <textarea value={content} onChange={(e) => setContent(e.target.value)} rows={4} className={`${field} resize-none`} />
 
         <input

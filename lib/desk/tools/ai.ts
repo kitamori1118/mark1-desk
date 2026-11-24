@@ -109,3 +109,39 @@ export const report = defineTool({
     return 'report: 回答を表示します';
   },
 });
+
+/* ------------------------------------------------------------------ */
+/* summarize_bullets：箇条書きでまとめる（AIが要点を書く）                 */
+/* ------------------------------------------------------------------ */
+
+export const summarizeBullets = defineTool({
+  name: 'summarize_bullets',
+  phase: 41,
+  replayable: false,
+  description:
+    '対象ノードの内容を読んで、要点を箇条書きにまとめる（題名つき）。回答パネルに出すか、まとめノードとして残す。「箇条書きでまとめて」「要点を3つに」「議事録っぽく要約して」',
+  argsHint: '{ title?: string（まとめの題名・15字以内）, bullets: string[]（要点。3〜10個、各40字以内、体言止めか短文）, asNode?: boolean（trueならまとめノードとして追加。既定false=回答パネル） }',
+  defaultTarget: 'all',
+  argsSchema: z.object({
+    title: z.string().nullish(),
+    bullets: z.array(z.string().min(1)).min(1).max(15),
+    asNode: z.boolean().nullish(),
+  }),
+  async run(ctx, targets, args) {
+    const title = args.title?.trim() || 'まとめ';
+    const body = args.bullets.map((b) => `・${b.trim()}`).join('\n');
+    if (args.asNode) {
+      await ctx.insertNodes([
+        {
+          content: `${title}\n${body}`,
+          category: 'まとめ',
+          color: 'violet',
+          metadata: { tags: ['まとめ'], title, ai: true, sources: targets.slice(0, 30).map((n) => n.id) },
+        },
+      ]);
+      return `summarize_bullets: 「${title}」を${args.bullets.length}項目のノードとして追加`;
+    }
+    ctx.reports.push(`■ ${title}\n${body}`);
+    return `summarize_bullets: ${args.bullets.length}項目にまとめました`;
+  },
+});

@@ -3,9 +3,9 @@ import { autoTag, diagnosticScan, spectrumShift, zoom } from './basic';
 import { crystallizeCore, mergeDuplicates, splitNode } from './structure';
 import { arrangeView, clusterView, groupView, matrixView, orbitView, resetView, timelineView } from './view';
 import { linkNodes, unlinkNodes } from './links';
-import { archiveNodes, deadlineAlert, deleteNodes, findDuplicates, pinNodes, setDue, setStage } from './meta';
+import { archiveNodes, deadlineAlert, deleteNodes, findDuplicates, listNodes, pinNodes, resizeNodes, setDue, setStage, setTitle } from './meta';
 import { stackNodes, unstackNodes } from './stack';
-import { expandIdeas, extractActions, report, rewriteNode } from './ai';
+import { expandIdeas, extractActions, report, rewriteNode, summarizeBullets } from './ai';
 
 /**
  * 新しい機能を足すときは、tools/ に defineTool() で1つ書いて、ここに1行足すだけ。
@@ -20,16 +20,19 @@ export const ALL_TOOLS: ToolDef[] = [
   autoTag,
   setDue,
   setStage,
+  setTitle,
   linkNodes,
   unlinkNodes,
   // AIが新しいノードを生む
   crystallizeCore,
   extractActions,
+  summarizeBullets,
   expandIdeas,
   // 見た目・状態
   zoom,
   spectrumShift,
   pinNodes,
+  resizeNodes,
   archiveNodes,
   deleteNodes,
   stackNodes,
@@ -46,5 +49,6 @@ export const ALL_TOOLS: ToolDef[] = [
   matrixView,
   resetView,
   // 回答
+  listNodes,
   report,
 ].sort((a, b) => a.phase - b.phase);
