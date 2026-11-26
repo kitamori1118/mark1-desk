@@ -6,10 +6,11 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import type { DeskNode, ViewDirective, ViewLayout } from '@/lib/desk/types';
 import NodeSheet, { type SheetPatch } from '@/lib/desk/ui/NodeSheet';
+import BackupSheet, { type BackupRow } from '@/lib/desk/ui/BackupSheet';
 import { overviewSuggestions, suggestionsForNewNode, type Suggestion } from '@/lib/desk/insights';
 import { parseViewCommand, type ViewAction } from '@/lib/desk/viewCommands';
 import { computeViewPositions } from '@/lib/desk/layoutPositions';
-import { daysUntil, toDateTime } from '@/lib/desk/selector';
+import { daysUntil, toDateTime, toDay, toTime } from '@/lib/desk/selector';
 
 interface StarkNode {
   id: string;
@@ -83,6 +84,7 @@ const freeOrbSize = () => (typeof window !== 'undefined' && window.innerWidth >=
 
 const WHISPER_KEY = 'mark1desk.whisper';
 const TIME_KEY = 'mark1desk.showTime';
+const BACKUP_KEY = 'mark1desk.backups';
 const ZOOM_KEY = 'mark1desk.zoom';
 const ORB_KEY = 'mark1desk.orbScale';
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
@@ -120,6 +122,8 @@ export default function Mark1DeskPage() {
   const dragGroup = useRef<{ ids: string[]; base: Record<string, Pos>; start: { x: number; y: number } } | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set()); // Shift+クリック／選択モードで選んだオーブ
   const [selectMode, setSelectMode] = useState(false);
+  const [backupOpen, setBackupOpen] = useState(false);
+  const lastBackupRef = useRef(0);
   // 📷 画面（カメラ）：拡大率・オーブ全体の大きさ・表示領域のサイズ
   const [zoom, setZoom] = useState(1);
   const zoomRef = useRef(1);
@@ -402,10 +406,50 @@ export default function Mark1DeskPage() {
     }
   };
 
+  /**
+   * 自動バックアップ：開いている間、約1時間ごとに全ノードのコピーを保存する（この端末＋サーバー）。
+   * 空の状態は保存しない。サーバーは「1時間に1回だけ」書き、悪い状態で上書きしない。
+   */
+  const maybeBackup = (rows: StarkNode[]) => {
+    if (rows.length === 0) return;
+    const t = Date.now();
+    if (t - lastBackupRef.current < 10 * 60_000) return;
+    lastBackupRef.current = t;
+    try {
+      const arr: { t: number; nodes: StarkNode[] }[] = JSON.parse(localStorage.getItem(BACKUP_KEY) ?? '[]');
+      const last = arr[arr.length - 1];
+      if (!last || t - last.t > 55 * 60_000) {
+        arr.push({ t, nodes: rows });
+        while (arr.length > 8) arr.shift();
+        localStorage.setItem(BACKUP_KEY, JSON.stringify(arr));
+      }
+    } catch {
+      /* 容量不足などは無視 */
+    }
+    const d = new Date();
+    const slot = `${toDay(d)}-${toTime(d).slice(0, 2)}`;
+    supabase
+      .from('desk_backups')
+      .upsert({ id: slot, nodes: rows }, { onConflict: 'id', ignoreDuplicates: true })
+      .then(async ({ error }) => {
+        if (error) return; // テーブル未作成でも、アプリは普通に動く
+        const { data } = await supabase.from('desk_backups').select('id').order('taken_at', { ascending: false }).range(48, 200);
+        if (data?.length)
+          await supabase
+            .from('desk_backups')
+            .delete()
+            .in(
+              'id',
+              data.map((r: { id: string }) => r.id)
+            );
+      });
+  };
+
   const fetchNodes = async (forceRelayout = false) => {
     const { data: nodeData } = await supabase.from('stark_nodes').select('*').order('created_at', { ascending: false });
     if (nodeData) {
       setNodes(nodeData);
+      maybeBackup(nodeData);
       const live = nodeData.filter((n: StarkNode) => !n.metadata?.archived);
       if (forceRelayout) {
         relayoutNodes(live);
@@ -588,6 +632,16 @@ export default function Mark1DeskPage() {
 
   const runCommand = async (text: string, fromInput = false) => {
     if (!text.trim()) return;
+    if (/^\s*(undo|取り消し(て|ます)?|直前の(操作|指令)を(元に戻|取り消)(して|す)?)\s*[。.!！]*\s*$/i.test(text)) {
+      if (fromInput) setCommand('');
+      handleUndo();
+      return;
+    }
+    if (/^\s*(redo|やり直し(て|ます)?|(一手|1手)?進(む|んで|めて))\s*[。.!！]*\s*$/i.test(text)) {
+      if (fromInput) setCommand('');
+      handleRedo();
+      return;
+    }
     // 画面の見え方に関する指令は、サーバーに送らず、その場で実行する（即時・無料）
     const va = parseViewCommand(text);
     if (va) {
@@ -606,15 +660,110 @@ export default function Mark1DeskPage() {
     runCommand(command, true);
   };
 
-  const handleUndo = () =>
-    withLoading('取り消し中', async () => {
-      await handleResponse(await post({ action: 'undo' }));
+  /** 手動の編集・削除・追加も「戻す」の対象にするため、サーバーの履歴に記録する（待たない） */
+  const logOp = (label: string, before: StarkNode[], created: string[] = []) => {
+    const changed = before.map((n) => ({
+      id: n.id,
+      content: n.content,
+      category: n.category,
+      color: n.color,
+      status: n.status,
+      metadata: n.metadata ?? {},
+      created_at: n.created_at,
+    }));
+    post({ action: 'log_op', label, changed, created }, false);
+  };
+
+  const agoText = (min: number) => (min < 60 ? `${min}分前` : min < 1440 ? `${Math.round(min / 60)}時間前` : `${Math.round(min / 1440)}日前`);
+
+  /** 戻す／進む：何が起きるかを見せて、確認してから実行する */
+  const stepHistory = (kind: 'undo' | 'redo') =>
+    withLoading(kind === 'undo' ? '取り消しの確認' : 'やり直しの確認', async () => {
+      const d = await post({ action: 'ops_preview' });
+      if (!d || d.error) {
+        if (d?.error) setSystemLog(`ERROR: ${d.error}`);
+        return;
+      }
+      const p = kind === 'undo' ? d.undo : d.redo;
+      if (!p) {
+        setSystemLog(kind === 'undo' ? '戻せる操作がありません' : 'やり直せる操作がありません（「戻す」を押したあとだけ使えます）');
+        return;
+      }
+      const msg =
+        kind === 'undo'
+          ? `この操作を取り消します。\n\n「${p.command}」（${agoText(p.ageMin)}）\n元に戻す: ${p.changed}件 ／ 追加を取り消す: ${p.created}件\n\n※ ほかのノードや、その後に追加したものには触れません。`
+          : `取り消した操作をやり直します。\n\n「${p.command}」（${agoText(p.ageMin)}）\n再適用: ${p.changed + p.created}件`;
+      if (!window.confirm(msg)) {
+        setSystemLog('中止しました');
+        return;
+      }
+      await handleResponse(await post({ action: kind, opId: p.id }));
     });
+
+  const handleUndo = () => stepHistory('undo');
+  const handleRedo = () => stepHistory('redo');
 
   const runMacro = (m: Macro) =>
     withLoading(`マクロ「${m.name}」を実行中`, async () => {
       await handleResponse(await post({ action: 'run_macro', id: m.id }));
     });
+
+  /**
+   * バックアップから「統合」：今あるノードは変更・削除せず、足りないものだけ追加する（同じ内容は重複させない）。
+   * 既存ノードには、つながり（links）だけを足す。重ねていた山（stack）は、追加後にまとめて積み直す。
+   */
+  const mergeBackup = async (rows: BackupRow[], label: string) => {
+    const { data: cur, error: curErr } = await supabase.from('stark_nodes').select('id, content, metadata');
+    if (curErr) {
+      setSystemLog(`ERROR: 現在のデータを読めませんでした（${curErr.message}）`);
+      return;
+    }
+    const curRows = (cur ?? []) as { id: string; content: string; metadata: Record<string, any> | null }[];
+    const ids = new Set(curRows.map((r) => r.id));
+    const texts = new Set(curRows.map((r) => r.content.trim()));
+    const missing = rows.filter((r) => !ids.has(r.id) && !texts.has(r.content.trim()));
+    if (!missing.length) {
+      setSystemLog('統合するノードはありませんでした（すべて今のデータにあります）');
+      return;
+    }
+    const insertRows = missing.map((r) => ({
+      id: r.id,
+      content: r.content,
+      category: r.category ?? '一般',
+      color: r.color ?? 'cyan',
+      status: r.status ?? 'normal',
+      metadata: r.metadata ?? {},
+      ...(r.created_at ? { created_at: r.created_at } : {}),
+    }));
+    const { error } = await supabase.from('stark_nodes').upsert(insertRows, { onConflict: 'id', ignoreDuplicates: true });
+    if (error) {
+      setSystemLog(`ERROR: 統合に失敗しました（${error.message}）`);
+      return;
+    }
+    logOp(`🛟 バックアップを統合（${label}）`, [], missing.map((r) => r.id));
+
+    // 既存ノードには、つながりだけを足す（内容・色・位置は変えない）
+    const after = new Set([...ids, ...missing.map((r) => r.id)]);
+    for (const r of rows) {
+      const exist = curRows.find((c) => c.id === r.id);
+      const backupLinks: string[] = Array.isArray(r.metadata?.links) ? r.metadata!.links : [];
+      if (!exist || !backupLinks.length) continue;
+      const have: string[] = Array.isArray(exist.metadata?.links) ? exist.metadata!.links : [];
+      const add = backupLinks.filter((l) => after.has(l) && !have.includes(l));
+      if (add.length) await supabase.from('stark_nodes').update({ metadata: { ...(exist.metadata ?? {}), links: [...have, ...add] } }).eq('id', r.id);
+    }
+
+    // 山（スタック）：復元したノードを含む山を、積み直す
+    const groups = new Map<string, string[]>();
+    const addTo = (sid: string, id: string) => groups.set(sid, [...(groups.get(sid) ?? []), id]);
+    missing.forEach((r) => r.metadata?.stack && addTo(r.metadata.stack, r.id));
+    curRows.forEach((c) => c.metadata?.stack && groups.has(c.metadata.stack) && addTo(c.metadata.stack, c.id));
+
+    await fetchNodes();
+    const piles = [...groups.entries()].filter(([, v]) => v.length >= 2).map(([id, v]) => ({ id, ids: v }));
+    if (piles.length) applyStack(piles);
+    setSystemLog(`🛟 統合しました: ${missing.length}件を追加（既存の${rows.length - missing.length}件はそのまま）。「↶ 戻す」で取り消せます`);
+  };
 
   const copyReport = async () => {
     if (!report) return;
@@ -630,15 +779,16 @@ export default function Mark1DeskPage() {
   const reportToNode = async () => {
     if (!report) return;
     const first = report.split('\n')[0].replace(/^■\s*/, '').slice(0, 24);
-    const { error } = await supabase.from('stark_nodes').insert({
+    const { data: made, error } = await supabase.from('stark_nodes').insert({
       content: report.replace(/^■\s*/, ''),
       category: 'まとめ',
       color: 'violet',
       status: 'normal',
       metadata: { tags: ['まとめ'], title: first },
-    });
+    }).select('id').single();
     if (error) setSystemLog(`ERROR: ${error.message}`);
     else {
+      if (made?.id) logOp('📝 まとめを保存', [], [made.id]);
       setReport(null);
       await fetchNodes();
       setSystemLog('📝 ノードとして保存しました');
@@ -704,6 +854,7 @@ export default function Mark1DeskPage() {
       .single();
 
     if (!error && created) {
+      logOp('＋ 追加', [], [created.id]);
       const before = nodes; // 追加前のノード一覧（重複・関連の判定用）
       setRawInputContent('');
       setIsInputOpen(false);
@@ -751,6 +902,8 @@ export default function Mark1DeskPage() {
   };
 
   const deleteNodeById = async (id: string) => {
+    const target = nodes.find((n) => n.id === id);
+    if (target) logOp('🗑 削除', [target]);
     // .select() で「実際に消えた行」を受け取る。RLSに DELETE ポリシーが無いと、エラーなしで0件になる
     const { data, error } = await supabase.from('stark_nodes').delete().eq('id', id).select('id');
     if (error) {
@@ -780,6 +933,7 @@ export default function Mark1DeskPage() {
   const updateNode = async (id: string, columns: Record<string, unknown>, meta: Record<string, unknown>, doneMsg: string) => {
     const node = nodes.find((n) => n.id === id);
     if (!node) return;
+    logOp('✎ 編集', [node]);
     const metadata: Record<string, unknown> = { ...(node.metadata ?? {}) };
     Object.entries(meta).forEach(([k, v]) => {
       if (v === null || v === '' || v === false) delete metadata[k];
@@ -1038,6 +1192,7 @@ export default function Mark1DeskPage() {
 
   /** 複数オーブの metadata をまとめて更新（Shift選択の操作用） */
   const metaUpdate = async (ids: string[], meta: Record<string, unknown>) => {
+    logOp('☑ まとめて更新', nodes.filter((n) => ids.includes(n.id)));
     const results = await Promise.all(
       ids.map((id) => {
         const n = nodes.find((x) => x.id === id);
@@ -1080,7 +1235,8 @@ export default function Mark1DeskPage() {
 
   const bulkDeleteSelected = async () => {
     const ids = [...selected];
-    if (!ids.length || !window.confirm(`選択した${ids.length}件を削除しますか？`)) return;
+    if (!ids.length || !window.confirm(`選択した${ids.length}件を削除しますか？（「↶ 戻す」で復元できます）`)) return;
+    logOp('🗑 まとめて削除', nodes.filter((n) => ids.includes(n.id)));
     const { data, error } = await supabase.from('stark_nodes').delete().in('id', ids).select('id');
     if (error || !data?.length) {
       setSystemLog(`ERROR: 削除できませんでした（${error?.message ?? 'RLS の DELETE 許可を確認'}）`);
@@ -1161,8 +1317,14 @@ export default function Mark1DeskPage() {
           <p className="text-[9px] text-slate-400">FLUID ORB & COMMENT SCANNER ACTIVE</p>
         </div>
         <div className="flex flex-wrap justify-end items-center gap-1.5">
-          <button onClick={handleUndo} disabled={loading} className={headerBtn} title="直前の操作を取り消す">
+          <button onClick={handleUndo} disabled={loading} className={headerBtn} title="直前の操作を取り消す（確認してから実行）">
             ↶ 戻す
+          </button>
+          <button onClick={handleRedo} disabled={loading} className={headerBtn} title="戻した操作をやり直す">
+            ↷ 進む
+          </button>
+          <button onClick={() => setBackupOpen(true)} className={headerBtn} title="バックアップから統合して復元">
+            🛟
           </button>
           {archivedCount > 0 && (
             <button onClick={() => setShowArchived((v) => !v)} className={headerBtn} title="アーカイブ済みの表示切り替え">
@@ -1526,6 +1688,15 @@ export default function Mark1DeskPage() {
         })}
         </div>
       </main>
+
+      {backupOpen && (
+        <BackupSheet
+          currentNodes={nodes.map((n) => ({ id: n.id, content: n.content }))}
+          localKey={BACKUP_KEY}
+          onClose={() => setBackupOpen(false)}
+          onMerge={mergeBackup}
+        />
+      )}
 
       {selectedNode && (
         <NodeSheet

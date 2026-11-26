@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { executeDeskPlan } from '@/lib/deskEngine';
 import { compressNodes, createPlan, createWhisper, isReplayable, validateExecutionPlan } from '@/lib/desk/planner';
-import { undoLastOp } from '@/lib/desk/ops';
+import { previewOps, recordOp, redoOp, undoOp } from '@/lib/desk/ops';
 import { getResolvedModel } from '@/lib/desk/model';
 import { related } from '@/lib/desk/similar';
 import { localPlan } from '@/lib/desk/localPlan';
@@ -69,11 +69,17 @@ export async function POST(request: Request) {
     const action: string = typeof body?.action === 'string' ? body.action : 'command';
     const command = typeof body?.command === 'string' ? body.command.trim() : '';
 
-    /* ---------- Undo ---------- */
-    if (action === 'undo' || (action === 'command' && UNDO_RE.test(command))) {
+    /* ---------- 戻す／進む（実行前に、何が起きるかを確認させる） ---------- */
+    if (action === 'ops_preview') {
       const bad = await checkAuth();
       if (bad) return bad;
-      const r = await undoLastOp(db);
+      return NextResponse.json({ success: true, ...(await previewOps(db)) });
+    }
+    if (action === 'undo' || action === 'redo') {
+      const bad = await checkAuth();
+      if (bad) return bad;
+      if (typeof body.opId !== 'string') return fail(400, '対象の操作が指定されていません');
+      const r = action === 'undo' ? await undoOp(db, body.opId) : await redoOp(db, body.opId);
       return NextResponse.json({
         success: r.ok,
         log: r.message,
@@ -81,6 +87,19 @@ export async function POST(request: Request) {
         refresh: r.ok,
         view: r.ok ? { layout: 'free', order: [], hiddenIds: [] } : null,
       });
+    }
+    // 画面側で行った手動の編集・削除・追加も、履歴に残す（「戻す」の対象にする）
+    if (action === 'log_op') {
+      const bad = await checkAuth();
+      if (bad) return bad;
+      const changed = Array.isArray(body.changed) ? (body.changed as DeskNode[]).slice(0, 300) : [];
+      const created = Array.isArray(body.created) ? (body.created as string[]).slice(0, 300) : [];
+      if (!changed.length && !created.length) return NextResponse.json({ success: true });
+      await recordOp(db, String(body.label ?? '手動の操作'), { changed, created });
+      return NextResponse.json({ success: true });
+    }
+    if (action === 'command' && UNDO_RE.test(command)) {
+      return NextResponse.json({ success: true, log: '取り消しは、ヘッダーの「↶ 戻す」「↷ 進む」から行ってください（内容を確認してから実行します）' });
     }
 
     /* ---------- マクロ保存 ---------- */

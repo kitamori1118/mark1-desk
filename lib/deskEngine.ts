@@ -30,8 +30,14 @@ export async function executeDeskPlan(
 ) {
   const db = init.db; // ログイン中のユーザーとして動くDBクライアント（RLSが効く）
   let dirty = false;
-  // Undo 用：実行前の状態を控えておく（データが変わったときだけ履歴に保存する）
-  const before: DeskNode[] = JSON.parse(JSON.stringify(init.nodes));
+  // Undo 用：「この操作が触ったノード」だけ、変更前の姿を控える（他のノードには一切触れない）
+  const beforeById = new Map<string, DeskNode>(init.nodes.map((n) => [n.id, JSON.parse(JSON.stringify(n)) as DeskNode]));
+  const touched = new Map<string, DeskNode>();
+  const createdIds: string[] = [];
+  const touch = (id: string) => {
+    const b = beforeById.get(id);
+    if (b && !touched.has(id)) touched.set(id, b);
+  };
   const byId = () => new Map(ctx.nodes.map((n) => [n.id, n] as const));
 
   const ctx: ToolContext = {
@@ -52,6 +58,7 @@ export async function executeDeskPlan(
       const map = byId();
       const nodes = [...new Set(ids)].map((id) => map.get(id)).filter((n): n is DeskNode => !!n);
       if (!nodes.length) return;
+      nodes.forEach((n) => touch(n.id));
 
       const { metadata: metaPatch, ...rest } = patch;
       // 本文を書き換えたら、編集した時刻も記録しておく（表示・並べ替えに使う）
@@ -109,6 +116,7 @@ export async function executeDeskPlan(
       const { data, error } = await db.from('stark_nodes').insert(payload).select('*');
       if (error) throw new Error(`stark_nodes 追加に失敗: ${error.message}`);
       const created = (data ?? []).map(normalize);
+      created.forEach((n) => createdIds.push(n.id));
       ctx.nodes.push(...created);
       dirty = true;
       return created;
@@ -119,6 +127,7 @@ export async function executeDeskPlan(
       if (!unique.length) return;
       const { error } = await db.from('stark_nodes').delete().in('id', unique);
       if (error) throw new Error(`stark_nodes 削除に失敗: ${error.message}`);
+      unique.forEach(touch);
       const gone = new Set(unique);
       ctx.nodes = ctx.nodes.filter((n) => !gone.has(n.id));
       dirty = true;
@@ -157,7 +166,12 @@ export async function executeDeskPlan(
   let undoable = false;
   if (dirty && init.record !== false) {
     try {
-      await recordOp(db, init.command ?? '(command)', before);
+      // この操作の中で作って、そのまま消したノードは記録不要
+      const alive = new Set(ctx.nodes.map((n) => n.id));
+      await recordOp(db, init.command ?? '(command)', {
+        changed: [...touched.values()],
+        created: createdIds.filter((id) => alive.has(id)),
+      });
       undoable = true;
     } catch (e) {
       logs.push(`⚠ 履歴(Undo)を保存できませんでした: ${e instanceof Error ? e.message : String(e)}`);
